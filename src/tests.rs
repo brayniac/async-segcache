@@ -548,7 +548,7 @@ mod loom_tests {
             let t1 = thread::spawn(move || {
                 let segment = c1.segments().get(seg_id).unwrap();
                 let mut buffer = vec![0u8; 1024];
-                let result = segment.get_item(offset, b"key", &mut buffer);
+                let result = segment.get_item(offset, b"key");
 
                 // Validate the result inside the thread
                 match result {
@@ -655,7 +655,7 @@ mod loom_tests {
             let t2 = thread::spawn(move || {
                 let segment = c2.segments().get(seg_id).unwrap();
                 let mut buffer = vec![0u8; 1024];
-                let result = segment.get_item(offset, b"key", &mut buffer);
+                let result = segment.get_item(offset, b"key");
 
                 match result {
                     Ok(item) => {
@@ -1020,7 +1020,7 @@ mod loom_tests {
 
             // Get the value - should be either value1 or value2 depending on which won
             let mut buffer = vec![0u8; 1024];
-            let item = cache.get_with_buffer(b"concurrent_key", &mut buffer);
+            let item = cache.get(b"concurrent_key");
             assert!(item.is_ok(), "Key should exist after concurrent sets");
 
             let item = item.unwrap();
@@ -1062,11 +1062,11 @@ mod loom_tests {
 
             // Both keys should be retrievable
             let mut buffer = vec![0u8; 1024];
-            let item1 = cache.get_with_buffer(b"key1", &mut buffer);
+            let item1 = cache.get(b"key1");
             assert!(item1.is_ok());
             assert_eq!(item1.unwrap().value(), b"value1");
 
-            let item2 = cache.get_with_buffer(b"key2", &mut buffer);
+            let item2 = cache.get(b"key2");
             assert!(item2.is_ok());
             assert_eq!(item2.unwrap().value(), b"value2");
         });
@@ -1092,7 +1092,7 @@ mod loom_tests {
             // Thread 2: get the key
             let t2 = thread::spawn(move || {
                 let mut buffer = vec![0u8; 1024];
-                c2.get(b"race_key", &mut buffer).map(|item| {
+                c2.get(b"race_key").map(|item| {
                     item.value().to_vec()
                 })
             });
@@ -1156,7 +1156,7 @@ mod loom_tests {
     //
     //         // Try to get the key - may or may not exist depending on operation order
     //         let mut buffer = vec![0u8; 1024];
-    //         let get_result = cache.get_with_buffer(b"delete_race", &mut buffer);
+    //         let get_result = cache.get(b"delete_race");
     //
     //         if items == 1 {
     //             // If item exists, it should be "updated"
@@ -1256,7 +1256,7 @@ mod loom_tests {
 
             // Verify the key exists and has one of the three values
             let mut buffer = vec![0u8; 1024];
-            let item = cache.get_with_buffer(b"triple", &mut buffer);
+            let item = cache.get(b"triple");
             assert!(item.is_ok());
             let item = item.unwrap();
             let value = item.value();

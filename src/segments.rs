@@ -1880,7 +1880,6 @@ mod tests {
 
         // Read them back
         let mut buffer = vec![0u8; 1024];
-
         let item1 = segment.get_item(offset1, b"key1", &mut buffer).unwrap();
         assert_eq!(item1.key(), b"key1");
         assert_eq!(item1.value(), b"value1");
@@ -2294,8 +2293,7 @@ mod tests {
         assert_eq!(segment.bucket_id(), None);
 
         // Verify we can still get the new value
-        let mut buffer = vec![0u8; 1024];
-        let item = cache.get_with_buffer(b"testkey", &mut buffer).unwrap();
+        let item = cache.get(b"testkey").unwrap();
         assert_eq!(item.value(), b"new_value");
     }
 

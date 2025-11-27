@@ -262,50 +262,6 @@ impl Cache {
             .map_err(|_| SetItemError::HashTableInsertFailed)
     }
 
-    /// Get an item from the cache into a provided buffer
-    ///
-    /// This method is useful when you want to reuse buffers across multiple gets
-    /// to avoid allocations. For most use cases, prefer `get()` which returns
-    /// a zero-copy ItemGuard.
-    ///
-    /// # Parameters
-    ///
-    /// * `key` - The key to look up
-    /// * `buffer` - Buffer to copy the item data into (must be large enough)
-    ///
-    /// # Returns
-    ///
-    /// - `Ok(Item)` - Item with data copied into the provided buffer
-    /// - `Err(GetItemError::BufferTooSmall)` - Buffer is too small for the item
-    /// - `Err(GetItemError::NotFound)` - Key not found or item expired
-    pub fn get_with_buffer<'a>(&self, key: &[u8], buffer: &'a mut [u8]) -> Result<Item<'a>, GetItemError> {
-        // Step 1: Look up item in hashtable
-        let (segment_id, offset) = self
-            .core.hashtable
-            .get(key, &self.core.segments)
-            .ok_or(GetItemError::NotFound)?;
-
-        // Step 2: Check if segment has expired
-        if let Some(segment) = self.core.segments.get(segment_id) {
-            let now = clocksource::coarse::Instant::now();
-            if now >= segment.expire_at() {
-                // Segment has expired - mark item as deleted and unlink
-                self.core.metrics.item_expire.increment();
-
-                // Mark deleted in segment (ignore errors - item may already be deleted)
-                let _ = segment.mark_deleted(offset, key, &self.core.metrics);
-
-                // Unlink from hashtable
-                self.core.hashtable.unlink_item(key, segment_id, offset, &self.core.metrics);
-
-                return Err(GetItemError::NotFound);
-            }
-        }
-
-        // Step 3: Read item from segment
-        self.core.segments.get_item(segment_id, offset, key, buffer)
-    }
-
     /// Get an item from the cache with zero-copy access.
     ///
     /// Returns an ItemGuard that provides direct access to the item's data in the segment
@@ -329,7 +285,7 @@ impl Cache {
     ///
     /// ```ignore
     /// // Zero-copy read
-    /// let guard = cache.get_with_buffer(b"key")?;
+    /// let guard = cache.get(b"key")?;
     /// let value = guard.value();
     /// process_data(value);
     ///
@@ -1046,8 +1002,7 @@ mod cache_tests {
         cache.set(b"test_key", b"test_value", b"", ttl).await.unwrap();
 
         // Get the item
-        let mut buffer = vec![0u8; 1024];
-        let item = cache.get_with_buffer(b"test_key", &mut buffer).unwrap();
+        let item = cache.get(b"test_key").unwrap();
 
         assert_eq!(item.key(), b"test_key");
         assert_eq!(item.value(), b"test_value");
@@ -1092,8 +1047,7 @@ mod cache_tests {
         cache.set(b"no_ttl_key", b"some_value", b"", None).await.unwrap();
 
         // Verify we can get it back
-        let mut buffer = vec![0u8; 1024];
-        let item = cache.get_with_buffer(b"no_ttl_key", &mut buffer).unwrap();
+        let item = cache.get(b"no_ttl_key").unwrap();
 
         assert_eq!(item.key(), b"no_ttl_key");
         assert_eq!(item.value(), b"some_value");
@@ -1103,8 +1057,7 @@ mod cache_tests {
     async fn test_get_not_found() {
         let cache = Cache::new();
 
-        let mut buffer = vec![0u8; 1024];
-        let result = cache.get_with_buffer(b"nonexistent_key", &mut buffer);
+        let result = cache.get(b"nonexistent_key");
 
         assert!(matches!(result, Err(GetItemError::NotFound)));
     }
@@ -1117,14 +1070,13 @@ mod cache_tests {
         cache.set(b"delete_me", b"value", b"", Some(Duration::from_secs(60))).await.unwrap();
 
         // Verify it exists
-        let mut buffer = vec![0u8; 1024];
-        assert!(cache.get_with_buffer(b"delete_me", &mut buffer).is_ok());
+        assert!(cache.get(b"delete_me").is_ok());
 
         // Delete it
         cache.delete(b"delete_me").await.unwrap();
 
         // Verify it's gone
-        let result = cache.get_with_buffer(b"delete_me", &mut buffer);
+        let result = cache.get(b"delete_me");
         assert!(matches!(result, Err(GetItemError::NotFound)));
     }
 
@@ -1158,8 +1110,7 @@ mod cache_tests {
         cache.set(b"key_with_opt", b"value", optional, Some(Duration::from_secs(60))).await.unwrap();
 
         // Get the item
-        let mut buffer = vec![0u8; 1024];
-        let item = cache.get_with_buffer(b"key_with_opt", &mut buffer).unwrap();
+        let item = cache.get(b"key_with_opt").unwrap();
 
         assert_eq!(item.key(), b"key_with_opt");
         assert_eq!(item.value(), b"value");
@@ -1182,8 +1133,7 @@ mod cache_tests {
             let key = format!("key_{}", i);
             let expected_value = format!("value_{}", i);
 
-            let mut buffer = vec![0u8; 1024];
-            let item = cache.get_with_buffer(key.as_bytes(), &mut buffer).unwrap();
+                let item = cache.get(key.as_bytes()).unwrap();
 
             assert_eq!(item.key(), key.as_bytes());
             assert_eq!(item.value(), expected_value.as_bytes());
@@ -1207,8 +1157,7 @@ mod cache_tests {
         let bytes_after_overwrite = cache.metrics().bytes_live.value();
 
         // Try to get the value
-        let mut buffer = vec![0u8; 1024];
-        let item = cache.get_with_buffer(b"overwrite", &mut buffer).unwrap();
+        let item = cache.get(b"overwrite").unwrap();
         let retrieved_value = item.value();
 
         println!(
@@ -1260,11 +1209,10 @@ mod cache_tests {
         cache.set(b"test2", b"value2", b"", Some(Duration::from_secs(60))).await.unwrap();
 
         // Verify they can be retrieved
-        let mut buffer = vec![0u8; 1024];
-        let item1 = cache.get_with_buffer(b"test1", &mut buffer).unwrap();
+        let item1 = cache.get(b"test1").unwrap();
         assert_eq!(item1.value(), b"value1");
 
-        let item2 = cache.get_with_buffer(b"test2", &mut buffer).unwrap();
+        let item2 = cache.get(b"test2").unwrap();
         assert_eq!(item2.value(), b"value2");
     }
 
@@ -1280,8 +1228,7 @@ mod cache_tests {
         cache.set(key, value, &[], Some(short_ttl)).await.unwrap();
 
         // Should be able to get it immediately
-        let mut buffer = vec![0u8; 1024];
-        let item = cache.get_with_buffer(key, &mut buffer).unwrap();
+        let item = cache.get(key).unwrap();
         assert_eq!(item.value(), value);
 
         // Check initial expiration state
@@ -1298,7 +1245,7 @@ mod cache_tests {
         std::thread::sleep(std::time::Duration::from_secs(2));
 
         // Should not be able to get it after expiration
-        let result = cache.get_with_buffer(key, &mut buffer);
+        let result = cache.get(key);
         assert!(result.is_err(), "Item should have expired");
 
         // Verify expiration metric was incremented
@@ -1381,7 +1328,7 @@ mod cache_tests {
         // Verify we can still read items (at least recent ones should be available)
         let mut buffer = vec![0u8; 200 * 1024]; // Buffer large enough for items
         let recent_key = format!("large_key_{}", items_to_insert - 1);
-        let item = cache.get_with_buffer(recent_key.as_bytes(), &mut buffer)
+        let item = cache.get(recent_key.as_bytes())
             .expect("Should be able to read most recent item");
 
         assert_eq!(item.value().len(), large_value.len());
@@ -1472,10 +1419,9 @@ mod cache_tests {
             "Should reserve at least {} segments, got {}", num_items, segments_reserved);
 
         // Verify we can read all items (chain integrity maintained)
-        let mut buffer = vec![0u8; 1024 * 1024];
         for i in 0..num_items {
             let key = format!("chain_key_{}", i);
-            let item = cache.get_with_buffer(key.as_bytes(), &mut buffer)
+            let item = cache.get(key.as_bytes())
                 .expect(&format!("Should be able to read item {}", i));
             assert_eq!(item.value().len(), large_value.len());
         }
@@ -1514,16 +1460,15 @@ mod cache_tests {
             "Should have evicted at least 10 segments from chain, got {}", evictions);
 
         // Verify recent items are still accessible
-        let mut buffer = vec![0u8; 1024 * 1024];
         for i in (num_items - 5)..num_items {
             let key = format!("evict_chain_{}", i);
-            cache.get_with_buffer(key.as_bytes(), &mut buffer)
+            cache.get(key.as_bytes())
                 .expect(&format!("Recent item {} should be accessible", i));
         }
 
         // Old items should be evicted
         let old_key = b"evict_chain_0";
-        let result = cache.get_with_buffer(old_key, &mut buffer);
+        let result = cache.get(old_key);
         assert!(matches!(result, Err(GetItemError::NotFound)),
             "Old items should be evicted");
     }
@@ -1542,10 +1487,9 @@ mod cache_tests {
         }
 
         // All items should be retrievable (proves chain is intact)
-        let mut buffer = vec![0u8; 1024 * 1024];
         for i in 0..3 {
             let key = format!("chain_{}", i);
-            assert!(cache.get_with_buffer(key.as_bytes(), &mut buffer).is_ok(),
+            assert!(cache.get(key.as_bytes()).is_ok(),
                 "Item {} should be in chain", i);
         }
 
@@ -1558,7 +1502,7 @@ mod cache_tests {
         // All items should still be retrievable
         for i in 0..6 {
             let key = format!("chain_{}", i);
-            assert!(cache.get_with_buffer(key.as_bytes(), &mut buffer).is_ok(),
+            assert!(cache.get(key.as_bytes()).is_ok(),
                 "Item {} should be in extended chain", i);
         }
 
@@ -1604,10 +1548,9 @@ mod cache_tests {
             segments_after_reuse);
 
         // Verify old items are gone
-        let mut buffer = vec![0u8; 1024 * 1024];
         for i in 0..5 {
             let key = format!("fill_{}", i);
-            let result = cache.get_with_buffer(key.as_bytes(), &mut buffer);
+            let result = cache.get(key.as_bytes());
             assert!(matches!(result, Err(GetItemError::NotFound)),
                 "Old item {} should be evicted", i);
         }
@@ -1615,7 +1558,7 @@ mod cache_tests {
         // Verify new items are accessible
         for i in 5..10 {
             let key = format!("fill_{}", i);
-            assert!(cache.get_with_buffer(key.as_bytes(), &mut buffer).is_ok(),
+            assert!(cache.get(key.as_bytes()).is_ok(),
                 "New item {} should be accessible", i);
         }
     }
@@ -1775,15 +1718,14 @@ mod cache_tests {
         cache.set(b"long_ttl", b"value3", b"", Some(Duration::from_secs(3600))).await.unwrap();
 
         // Verify all items are accessible
-        let mut buffer = [0u8; 256];
 
-        let item1 = cache.get_with_buffer(b"short_ttl", &mut buffer).unwrap();
+        let item1 = cache.get(b"short_ttl").unwrap();
         assert_eq!(item1.value(), b"value1");
 
-        let item2 = cache.get_with_buffer(b"medium_ttl", &mut buffer).unwrap();
+        let item2 = cache.get(b"medium_ttl").unwrap();
         assert_eq!(item2.value(), b"value2");
 
-        let item3 = cache.get_with_buffer(b"long_ttl", &mut buffer).unwrap();
+        let item3 = cache.get(b"long_ttl").unwrap();
         assert_eq!(item3.value(), b"value3");
 
         // Verify they went to different TTL buckets by checking segment distribution
@@ -1833,11 +1775,10 @@ mod cache_tests {
         );
 
         // Verify that some items survived and cache is still functional
-        let mut buffer = [0u8; 600 * 1024];
         let survivors = (0..12)
             .filter(|&i| {
                 let key = format!("item_{}", i);
-                cache.get_with_buffer(key.as_bytes(), &mut buffer).is_ok()
+                cache.get(key.as_bytes()).is_ok()
             })
             .count();
 
@@ -1880,12 +1821,11 @@ mod cache_tests {
         }
 
         // Verify all items are accessible
-        let mut buffer = [0u8; 256];
         for (i, &ttl) in ttls.iter().enumerate() {
             let key = format!("key_{}", i);
             let expected_value = format!("value_with_ttl_{}", ttl);
 
-            let item = cache.get_with_buffer(key.as_bytes(), &mut buffer).unwrap();
+            let item = cache.get(key.as_bytes()).unwrap();
             assert_eq!(
                 item.value(),
                 expected_value.as_bytes(),
@@ -1920,11 +1860,10 @@ mod cache_tests {
         ).await.unwrap();
 
         // Verify all are accessible
-        let mut buffer = [0u8; 256];
 
-        cache.get_with_buffer(b"no_ttl_1", &mut buffer).unwrap();
-        cache.get_with_buffer(b"no_ttl_2", &mut buffer).unwrap();
-        cache.get_with_buffer(b"explicit_long", &mut buffer).unwrap();
+        cache.get(b"no_ttl_1").unwrap();
+        cache.get(b"no_ttl_2").unwrap();
+        cache.get(b"explicit_long").unwrap();
 
         // Items without TTL might share segments with each other
         let (seg1, _) = cache.hashtable().get(b"no_ttl_1", &cache.segments()).unwrap();
@@ -1966,10 +1905,9 @@ mod cache_tests {
         );
 
         // Verify all items are still accessible
-        let mut buffer = [0u8; 128 * 1024];
         for i in 0..10 {
             let key = format!("item_{}", i);
-            let result = cache.get_with_buffer(key.as_bytes(), &mut buffer);
+            let result = cache.get(key.as_bytes());
             assert!(
                 result.is_ok(),
                 "Item {} should be accessible",
@@ -2029,11 +1967,10 @@ mod cache_tests {
         assert_eq!(links, successful as u64, "Links should match successful inserts");
 
         // Verify all successful items are accessible
-        let mut buffer = [0u8; 128];
         let mut accessible_count = 0;
         for i in 0..20 {
             let key = format!("bucket_{:03}", i);
-            if cache.get_with_buffer(key.as_bytes(), &mut buffer).is_ok() {
+            if cache.get(key.as_bytes()).is_ok() {
                 accessible_count += 1;
             }
         }
@@ -2164,11 +2101,10 @@ mod cache_tests {
         );
 
         // All successfully inserted items should be accessible
-        let mut buffer = [0u8; 128];
         let mut accessible = 0;
         for i in 0..200 {
             let key = format!("item_{}", i);
-            if cache.get_with_buffer(key.as_bytes(), &mut buffer).is_ok() {
+            if cache.get(key.as_bytes()).is_ok() {
                 accessible += 1;
             }
         }

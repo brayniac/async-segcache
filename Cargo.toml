@@ -12,7 +12,7 @@ rand = "0.8"
 tokio = { version = "1", features = ["sync", "rt", "macros", "rt-multi-thread"] }
 
 [features]
-default = ["validation"]
+default = []
 loom = ["dep:loom"]
 # Adds magic bytes and checksums to item headers for corruption detection (~3 bytes per item)
 validation = []

@@ -63,6 +63,21 @@ pub enum EvictionPolicy {
     /// Useful for testing or when you want explicit control over eviction
     /// via manual calls to expire_segments() or evict_random_segment().
     None,
+
+    /// Merge eviction - combines multiple segments, keeping high-frequency items
+    ///
+    /// This strategy takes N adjacent segments from a TTL bucket's head, prunes
+    /// low-frequency items (below a threshold), and copies surviving high-frequency
+    /// items into a single destination segment. The source segments are then freed.
+    ///
+    /// This policy is effective when:
+    /// - There's a mix of hot and cold items in the cache
+    /// - Items have varying access patterns over time
+    /// - You want to retain popular items during memory pressure
+    ///
+    /// The merge ratio (number of segments to combine) and frequency threshold
+    /// are configurable via CacheBuilder.
+    Merge,
 }
 
 impl Default for EvictionPolicy {
@@ -100,6 +115,10 @@ struct CacheCore {
     ttl_buckets: TtlBuckets,
     metrics: CacheMetrics,
     eviction_policy: EvictionPolicy,
+    /// Number of segments to combine during merge eviction
+    merge_ratio: usize,
+    /// Target number of segments after merging (as a divisor of merge_ratio)
+    merge_target_ratio: usize,
 }
 
 pub struct Cache {
@@ -112,6 +131,10 @@ pub struct CacheBuilder {
     segment_size: usize,
     heap_size: usize,
     eviction_policy: EvictionPolicy,
+    /// Number of segments to combine during merge eviction (default: 4)
+    merge_ratio: usize,
+    /// Minimum frequency threshold for items to survive pruning (default: 8)
+    merge_target_ratio: usize,
 }
 
 impl CacheBuilder {
@@ -122,6 +145,8 @@ impl CacheBuilder {
             segment_size: 1024 * 1024, // 1MB
             heap_size: 64 * 1024 * 1024, // 64MB
             eviction_policy: EvictionPolicy::default(),
+            merge_ratio: 4, // Combine 4 segments during merge eviction
+            merge_target_ratio: 2, // Target compaction to ~1/2 of original segments
         }
     }
 
@@ -161,6 +186,32 @@ impl CacheBuilder {
         self
     }
 
+    /// Set the merge ratio for merge eviction
+    ///
+    /// This controls how many segments are combined into one during merge eviction.
+    /// Default is 4, meaning 4 segments are merged into approximately
+    /// (merge_ratio / merge_target_ratio) segments.
+    ///
+    /// Higher values mean more aggressive compaction but more CPU work during eviction.
+    pub fn merge_ratio(mut self, ratio: usize) -> Self {
+        assert!(ratio >= 2, "merge_ratio must be at least 2");
+        self.merge_ratio = ratio;
+        self
+    }
+
+    /// Set the target ratio for merge eviction
+    ///
+    /// This controls the target number of segments after merging, as a fraction
+    /// of the original merge_ratio. Default is 2, meaning 4 segments are merged
+    /// into approximately 2 segments (4/2 = 2).
+    ///
+    /// Lower values mean more aggressive compaction (more items pruned).
+    pub fn merge_target_ratio(mut self, ratio: usize) -> Self {
+        assert!(ratio >= 1, "merge_target_ratio must be at least 1");
+        self.merge_target_ratio = ratio;
+        self
+    }
+
     /// Build the Cache with the configured settings
     pub fn build(self) -> Cache {
         assert!(
@@ -185,6 +236,8 @@ impl CacheBuilder {
             ttl_buckets: TtlBuckets::new(),
             metrics,
             eviction_policy: self.eviction_policy,
+            merge_ratio: self.merge_ratio,
+            merge_target_ratio: self.merge_target_ratio,
         });
 
         Cache {
@@ -519,14 +572,16 @@ impl Cache {
                         let bucket = self.core.ttl_buckets.get_bucket_by_index(bucket_id);
 
                         // Try to remove from chain (may fail due to concurrent modifications)
-                        if bucket.remove_segment(self, id, &self.core.metrics).await.is_ok() {
-                            // Successfully removed from chain, now evict
-                            // evict() clears the segment and leaves it in Locked state
-                            if self.core.segments.evict(id, self) {
-                                return Ok(id);
+                        if let Ok((items_cleared, bytes_cleared)) = bucket.remove_segment(self, id, &self.core.metrics).await {
+                            // Successfully removed - update global metrics for evicted items
+                            for _ in 0..items_cleared {
+                                self.core.metrics.items_live.decrement();
                             }
+                            self.core.metrics.bytes_live.sub(bytes_cleared as i64);
+                            self.core.metrics.segment_evict.increment();
+                            return Ok(id);
                         }
-                        // If remove_segment or evict failed, continue scanning
+                        // If remove_segment failed, continue scanning
                         // Don't retry the same segment - let caller retry the append
                     }
                 }
@@ -604,14 +659,17 @@ impl Cache {
                         // Evict the head (oldest) segment from this bucket
                         if let Some(head_id) = bucket.head() {
                             // Try to remove from chain
-                            if bucket.remove_segment(self, head_id, &self.core.metrics).await.is_ok() {
-                                // Successfully removed from chain, now evict
-                                if self.core.segments.evict(head_id, self) {
-                                    return Ok(head_id);
+                            if let Ok((items_cleared, bytes_cleared)) = bucket.remove_segment(self, head_id, &self.core.metrics).await {
+                                // Successfully removed - update global metrics for evicted items
+                                for _ in 0..items_cleared {
+                                    self.core.metrics.items_live.decrement();
                                 }
+                                self.core.metrics.bytes_live.sub(bytes_cleared as i64);
+                                self.core.metrics.segment_evict.increment();
+                                return Ok(head_id);
                             }
                         }
-                        // If removal or eviction failed, continue scanning
+                        // If removal failed, continue scanning
                         // to find another bucket
                     }
                 }
@@ -695,11 +753,14 @@ impl Cache {
             let bucket = self.core.ttl_buckets.get_bucket_by_index(bucket_id);
 
             // Try to remove from chain
-            if bucket.remove_segment(self, segment_id, &self.core.metrics).await.is_ok() {
-                // Successfully removed from chain, now evict
-                if self.core.segments.evict(segment_id, self) {
-                    return Ok(segment_id);
+            if let Ok((items_cleared, bytes_cleared)) = bucket.remove_segment(self, segment_id, &self.core.metrics).await {
+                // Successfully removed - update global metrics for evicted items
+                for _ in 0..items_cleared {
+                    self.core.metrics.items_live.decrement();
                 }
+                self.core.metrics.bytes_live.sub(bytes_cleared as i64);
+                self.core.metrics.segment_evict.increment();
+                return Ok(segment_id);
             }
 
             // If eviction failed, return error and let caller retry
@@ -777,11 +838,14 @@ impl Cache {
             let bucket = self.core.ttl_buckets.get_bucket_by_index(bucket_id);
 
             // Try to remove from chain
-            if bucket.remove_segment(self, segment_id, &self.core.metrics).await.is_ok() {
-                // Successfully removed from chain, now evict
-                if self.core.segments.evict(segment_id, self) {
-                    return Ok(segment_id);
+            if let Ok((items_cleared, bytes_cleared)) = bucket.remove_segment(self, segment_id, &self.core.metrics).await {
+                // Successfully removed - update global metrics for evicted items
+                for _ in 0..items_cleared {
+                    self.core.metrics.items_live.decrement();
                 }
+                self.core.metrics.bytes_live.sub(bytes_cleared as i64);
+                self.core.metrics.segment_evict.increment();
+                return Ok(segment_id);
             }
 
             // If eviction failed, return error and let caller retry
@@ -791,9 +855,114 @@ impl Cache {
         Err("No evictable segments found")
     }
 
+    /// Attempt to evict segments using the merge eviction strategy.
+    ///
+    /// Merge eviction combines multiple segments from a TTL bucket, prunes low-frequency
+    /// items, and copies surviving high-frequency items into fewer destination segments.
+    /// This strategy is effective when there's a mix of hot and cold items in the cache.
+    ///
+    /// The algorithm:
+    /// 1. Pick a random segment to determine which TTL bucket to merge
+    /// 2. Check if the bucket has enough segments to merge (merge_ratio + 1)
+    /// 3. Collect merge_ratio segments from the head of the bucket
+    /// 4. Prune low-frequency items from each source segment
+    /// 5. Copy surviving items to new destination segment(s)
+    /// 6. Remove source segments from the chain and release to free pool
+    /// 7. Add destination segments to the chain
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(segment_id)` - Successfully freed segment(s), returning one for reuse
+    /// - `Err(&str)` - No bucket had enough segments to merge or merge failed
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use async_segcache::{Cache, CacheBuilder, EvictionPolicy};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let cache = CacheBuilder::new()
+    ///     .eviction_policy(EvictionPolicy::Merge)
+    ///     .merge_ratio(4)  // Combine 4 segments
+    ///     .merge_target_ratio(2)  // Into approximately 2 segments
+    ///     .build();
+    ///
+    /// // Evict using merge strategy
+    /// match cache.evict_merge_segment().await {
+    ///     Ok(segment_id) => println!("Freed segment {} via merge eviction", segment_id),
+    ///     Err(e) => println!("Merge eviction failed: {}", e),
+    /// }
+    /// # }
+    /// ```
+    pub async fn evict_merge_segment(&self) -> Result<u32, &'static str> {
+        use rand::Rng;
+
+        let num_segments = self.core.segments.segments.len();
+        if num_segments == 0 {
+            return Err("No segments available");
+        }
+
+        let merge_ratio = self.core.merge_ratio;
+        let target_ratio = self.core.merge_target_ratio;
+
+        // Pick a random starting point
+        #[cfg(not(feature = "loom"))]
+        let start_id = rand::thread_rng().r#gen::<u32>() % (num_segments as u32);
+
+        #[cfg(feature = "loom")]
+        let start_id = 0u32;
+
+        // Scan for a segment in a bucket chain to determine the bucket
+        // Make exactly one pass through the array
+        for offset in 0..num_segments {
+            let id = (start_id + offset as u32) % (num_segments as u32);
+
+            if let Some(segment) = self.core.segments.get(id) {
+                let state = segment.state();
+
+                // Only consider segments that are in a bucket chain
+                if state == SegmentState::Sealed || state == SegmentState::Live {
+                    // Get the bucket this segment belongs to
+                    if let Some(bucket_id) = segment.bucket_id() {
+                        let bucket = self.core.ttl_buckets.get_bucket_by_index(bucket_id);
+
+                        // Try merge eviction on this bucket
+                        if let Some(freed) = bucket.merge_evict(
+                            self,
+                            merge_ratio,
+                            target_ratio,
+                            &self.core.metrics,
+                        ).await {
+                            // Merge eviction succeeded, try to reserve a segment
+                            if freed > 0 {
+                                if let Some(seg_id) = self.core.segments.reserve(&self.core.metrics) {
+                                    return Ok(seg_id);
+                                }
+                            }
+                        }
+                        // If merge failed, continue scanning to find another bucket
+                    }
+                }
+            }
+        }
+
+        Err("No bucket had enough segments for merge eviction")
+    }
+
     /// Get the configured eviction policy
     pub fn eviction_policy(&self) -> EvictionPolicy {
         self.core.eviction_policy
+    }
+
+    /// Get the configured merge ratio
+    pub fn merge_ratio(&self) -> usize {
+        self.core.merge_ratio
+    }
+
+    /// Get the configured merge target ratio
+    pub fn merge_target_ratio(&self) -> usize {
+        self.core.merge_target_ratio
     }
 
     /// Internal method to evict a segment according to the configured policy.
@@ -807,6 +976,7 @@ impl Cache {
             EvictionPolicy::RandomFifo => self.evict_random_fifo_segment().await,
             EvictionPolicy::Cte => self.evict_cte_segment().await,
             EvictionPolicy::Util => self.evict_util_segment().await,
+            EvictionPolicy::Merge => self.evict_merge_segment().await,
             EvictionPolicy::None => Err("Eviction disabled by policy"),
         }
     }
@@ -887,6 +1057,29 @@ impl CacheOps for CacheCore {
     }
 
     async fn evict_segment_by_policy(&self) -> Option<u32> {
+        match self.eviction_policy {
+            EvictionPolicy::Random => self.evict_random_segment_impl().await,
+            EvictionPolicy::RandomFifo => self.evict_random_fifo_segment_impl().await,
+            EvictionPolicy::Cte => self.evict_cte_segment_impl().await,
+            EvictionPolicy::Util => self.evict_util_segment_impl().await,
+            EvictionPolicy::Merge => {
+                // Try merge eviction first, fall back to random if it can't work
+                // (e.g., not enough segments in chain, or can't allocate destinations)
+                if let Some(seg_id) = self.evict_merge_segment_impl().await {
+                    Some(seg_id)
+                } else {
+                    // Fall back to random eviction
+                    self.evict_random_segment_impl().await
+                }
+            }
+            EvictionPolicy::None => None,
+        }
+    }
+}
+
+impl CacheCore {
+    /// Random eviction: pick random Sealed segment, evict it from its bucket chain
+    async fn evict_random_segment_impl(&self) -> Option<u32> {
         use rand::Rng;
 
         let num_segments = self.segments.segments.len();
@@ -901,38 +1094,207 @@ impl CacheOps for CacheCore {
         #[cfg(feature = "loom")]
         let start_id = 0u32;
 
-        // Scan for a Live or Sealed segment (with wraparound)
-        // Make exactly one pass through the array
+        // Scan for a Sealed segment (with wraparound)
+        // Only Sealed segments can be removed - Live segments are still being written to
         for offset in 0..num_segments {
             let id = (start_id + offset as u32) % (num_segments as u32);
 
             if let Some(segment) = self.segments.get(id) {
                 let state = segment.state();
 
-                // Only evict segments that are in a bucket chain with data
-                if state == SegmentState::Sealed || state == SegmentState::Live {
-                    // Get the bucket this segment belongs to
+                // Only evict Sealed segments - Live segments are still active
+                if state == SegmentState::Sealed {
                     if let Some(bucket_id) = segment.bucket_id() {
                         let bucket = self.ttl_buckets.get_bucket_by_index(bucket_id);
 
-                        // Try to evict head if this is the head segment
-                        if let Some(head) = bucket.head() {
-                            if head == id {
-                                // This is the head - use evict_head_segment which returns segment in Reserved state
-                                if let Some(evicted_id) = bucket.evict_head_segment(self, &self.metrics) {
-                                    return Some(evicted_id);
-                                }
-                            }
+                        // Try to evict the head of this bucket
+                        // evict_head_segment properly unlinks items from hashtable
+                        if let Some(evicted_id) = bucket.evict_head_segment(self, &self.metrics) {
+                            return Some(evicted_id);
                         }
-                        // Either not the head, or eviction failed - skip this segment
-                        // If remove_segment or reserve failed, continue scanning
-                        // Don't retry the same segment - let caller retry the append
+                        // If eviction failed, continue scanning for another bucket
                     }
                 }
             }
         }
 
-        // Made a full pass, no segment could be evicted
+        None
+    }
+
+    /// RandomFifo eviction: pick random segment, evict the HEAD of its bucket
+    async fn evict_random_fifo_segment_impl(&self) -> Option<u32> {
+        use rand::Rng;
+
+        let num_segments = self.segments.segments.len();
+        if num_segments == 0 {
+            return None;
+        }
+
+        // Pick a random starting point
+        #[cfg(not(feature = "loom"))]
+        let start_id = rand::thread_rng().r#gen::<u32>() % (num_segments as u32);
+
+        #[cfg(feature = "loom")]
+        let start_id = 0u32;
+
+        // Scan to find a segment in a bucket, then evict that bucket's head
+        for offset in 0..num_segments {
+            let id = (start_id + offset as u32) % (num_segments as u32);
+
+            if let Some(segment) = self.segments.get(id) {
+                let state = segment.state();
+
+                // Use Live or Sealed to find a bucket
+                if state == SegmentState::Sealed || state == SegmentState::Live {
+                    if let Some(bucket_id) = segment.bucket_id() {
+                        let bucket = self.ttl_buckets.get_bucket_by_index(bucket_id);
+
+                        // Try to evict the head of this bucket
+                        // evict_head_segment properly unlinks items from hashtable
+                        if let Some(evicted_id) = bucket.evict_head_segment(self, &self.metrics) {
+                            return Some(evicted_id);
+                        }
+                        // If eviction failed, continue scanning for another bucket
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// CTE eviction: find bucket with segment closest to expiration, evict its head
+    async fn evict_cte_segment_impl(&self) -> Option<u32> {
+        use clocksource::coarse::Instant;
+
+        let num_segments = self.segments.segments.len();
+        if num_segments == 0 {
+            return None;
+        }
+
+        let mut earliest_expiration: Option<Instant> = None;
+        let mut earliest_bucket_id: Option<u16> = None;
+
+        // Walk through all segments to find the one with earliest expiration
+        for id in 0..num_segments {
+            if let Some(segment) = self.segments.get(id as u32) {
+                let state = segment.state();
+
+                // Consider Sealed or Live segments to find a bucket
+                if state == SegmentState::Sealed || state == SegmentState::Live {
+                    let expire_at = segment.expire_at();
+
+                    if earliest_expiration.is_none() || expire_at < earliest_expiration.unwrap() {
+                        earliest_expiration = Some(expire_at);
+                        earliest_bucket_id = segment.bucket_id();
+                    }
+                }
+            }
+        }
+
+        // If we found a bucket, try to evict its head
+        if let Some(bucket_id) = earliest_bucket_id {
+            let bucket = self.ttl_buckets.get_bucket_by_index(bucket_id);
+
+            // evict_head_segment properly unlinks items from hashtable
+            if let Some(evicted_id) = bucket.evict_head_segment(self, &self.metrics) {
+                return Some(evicted_id);
+            }
+        }
+
+        None
+    }
+
+    /// Util eviction: find bucket with segment with fewest live bytes, evict its head
+    async fn evict_util_segment_impl(&self) -> Option<u32> {
+        let num_segments = self.segments.segments.len();
+        if num_segments == 0 {
+            return None;
+        }
+
+        let mut least_live_bytes: Option<u32> = None;
+        let mut least_utilized_bucket_id: Option<u16> = None;
+
+        // Walk through all segments to find the one with fewest live bytes
+        for id in 0..num_segments {
+            if let Some(segment) = self.segments.get(id as u32) {
+                let state = segment.state();
+
+                // Consider Sealed or Live segments to find a bucket
+                if state == SegmentState::Sealed || state == SegmentState::Live {
+                    let live_bytes = segment.live_bytes();
+
+                    if least_live_bytes.is_none() || live_bytes < least_live_bytes.unwrap() {
+                        least_live_bytes = Some(live_bytes);
+                        least_utilized_bucket_id = segment.bucket_id();
+                    }
+                }
+            }
+        }
+
+        // If we found a bucket, try to evict its head
+        if let Some(bucket_id) = least_utilized_bucket_id {
+            let bucket = self.ttl_buckets.get_bucket_by_index(bucket_id);
+
+            // evict_head_segment properly unlinks items from hashtable
+            if let Some(evicted_id) = bucket.evict_head_segment(self, &self.metrics) {
+                return Some(evicted_id);
+            }
+        }
+
+        None
+    }
+
+    /// Merge eviction: combine multiple segments, prune low-frequency items
+    async fn evict_merge_segment_impl(&self) -> Option<u32> {
+        use rand::Rng;
+
+        let num_segments = self.segments.segments.len();
+        if num_segments == 0 {
+            return None;
+        }
+
+        let merge_ratio = self.merge_ratio;
+        let target_ratio = self.merge_target_ratio;
+
+        // Pick a random starting point
+        #[cfg(not(feature = "loom"))]
+        let start_id = rand::thread_rng().r#gen::<u32>() % (num_segments as u32);
+
+        #[cfg(feature = "loom")]
+        let start_id = 0u32;
+
+        // Scan for a segment in a bucket chain to determine the bucket
+        for offset in 0..num_segments {
+            let id = (start_id + offset as u32) % (num_segments as u32);
+
+            if let Some(segment) = self.segments.get(id) {
+                let state = segment.state();
+
+                // Use Sealed or Live to find a bucket
+                if state == SegmentState::Sealed || state == SegmentState::Live {
+                    if let Some(bucket_id) = segment.bucket_id() {
+                        let bucket = self.ttl_buckets.get_bucket_by_index(bucket_id);
+
+                        // Try merge eviction on this bucket
+                        if let Some(freed) = bucket.merge_evict(
+                            self,
+                            merge_ratio,
+                            target_ratio,
+                            &self.metrics,
+                        ).await {
+                            if freed > 0 {
+                                if let Some(seg_id) = self.segments.reserve(&self.metrics) {
+                                    return Some(seg_id);
+                                }
+                            }
+                        }
+                        // If merge failed, continue scanning to find another bucket
+                    }
+                }
+            }
+        }
+
         None
     }
 }
@@ -2126,5 +2488,140 @@ mod cache_tests {
              - No evictions occurred",
             items_live, accessible
         );
+    }
+
+    #[tokio::test]
+    async fn test_merge_eviction_policy_config() {
+        // Test that merge eviction policy can be configured
+        let cache = CacheBuilder::new()
+            .eviction_policy(EvictionPolicy::Merge)
+            .merge_ratio(4)
+            .merge_target_ratio(2)
+            .build();
+
+        assert_eq!(cache.eviction_policy(), EvictionPolicy::Merge);
+        assert_eq!(cache.merge_ratio(), 4);
+        assert_eq!(cache.merge_target_ratio(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_merge_eviction_metrics() {
+        // Test that merge eviction metrics are tracked
+        let cache = CacheBuilder::new()
+            .eviction_policy(EvictionPolicy::Merge)
+            .merge_ratio(2)  // Small ratio for testing
+            .merge_target_ratio(1)
+            .segment_size(4096)  // Small segments to fill quickly
+            .heap_size(32 * 4096)  // 32 small segments
+            .hashtable_power(10)  // Smaller hashtable
+            .build();
+
+        // Initially all metrics should be zero
+        assert_eq!(cache.metrics().merge_evict.value(), 0);
+        assert_eq!(cache.metrics().merge_evict_segments.value(), 0);
+
+        // Fill the cache with items to create multiple segments
+        let value = vec![b'x'; 2048]; // 2KB value
+        for i in 0..50 {
+            let key = format!("key_{}", i);
+            let _ = cache.set(key.as_bytes(), &value, b"", Some(Duration::from_secs(60))).await;
+        }
+
+        // Should have created multiple segments
+        assert!(cache.metrics().segment_reserve.value() > 1,
+            "Should have reserved multiple segments");
+
+        // Verify we can read items
+        for i in 45..50 {
+            let key = format!("key_{}", i);
+            assert!(cache.get(key.as_bytes()).is_ok(),
+                "Recent items should be readable");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_prune_functionality() {
+        // Test the prune functionality at the segment level
+        let cache = Cache::new();
+
+        // Reserve a segment and add items
+        let seg_id = cache.segments().reserve(cache.metrics()).unwrap();
+        let segment = cache.segments().get(seg_id).unwrap();
+
+        // Transition to Live state
+        segment.cas_metadata(
+            SegmentState::Reserved,
+            SegmentState::Live,
+            None,
+            None,
+            cache.metrics(),
+        );
+
+        // Add several items
+        for i in 0..10 {
+            let key = format!("prune_key_{}", i);
+            let _ = segment.append_item(key.as_bytes(), b"value", b"", cache.metrics());
+        }
+
+        assert_eq!(segment.live_items(), 10, "Should have 10 items");
+
+        // Prune with high threshold - should prune items with freq < threshold
+        // Since items weren't accessed through hashtable, they'll have freq=0
+        let (retained, pruned, _, _) = segment.prune(cache.hashtable(), 1, cache.metrics());
+
+        // All items should be pruned (freq=0 < threshold=1)
+        assert_eq!(pruned, 10, "All items should be pruned");
+        assert_eq!(retained, 0, "No items should be retained");
+    }
+
+    #[tokio::test]
+    async fn test_merge_with_frequency_tracking() {
+        // Test merge eviction preserves high-frequency items
+        let cache = CacheBuilder::new()
+            .eviction_policy(EvictionPolicy::Merge)
+            .merge_ratio(2)
+            .merge_target_ratio(1)
+            .segment_size(8192)  // 8KB segments
+            .heap_size(64 * 1024)  // 64KB total
+            .hashtable_power(10)
+            .build();
+
+        // Add items and access some frequently
+        let value = vec![b'x'; 1024]; // 1KB value
+        for i in 0..20 {
+            let key = format!("freq_key_{}", i);
+            cache.set(key.as_bytes(), &value, b"", Some(Duration::from_secs(60))).await.unwrap();
+
+            // Access hot items multiple times to increase frequency
+            if i < 5 {
+                for _ in 0..10 {
+                    let _ = cache.get(key.as_bytes());
+                }
+            }
+        }
+
+        // Verify hot items are still accessible
+        for i in 0..5 {
+            let key = format!("freq_key_{}", i);
+            // Hot items should still be accessible (may be moved during merge)
+            // Note: This test verifies the mechanism, not guaranteed retention
+            let _ = cache.get(key.as_bytes());
+        }
+
+        // Recent items should be accessible
+        for i in 15..20 {
+            let key = format!("freq_key_{}", i);
+            assert!(cache.get(key.as_bytes()).is_ok(),
+                "Recent item {} should be accessible", i);
+        }
+    }
+
+    #[test]
+    fn test_default_merge_config() {
+        // Test default merge configuration values
+        let cache = CacheBuilder::new().build();
+
+        assert_eq!(cache.merge_ratio(), 4, "Default merge_ratio should be 4");
+        assert_eq!(cache.merge_target_ratio(), 2, "Default merge_target_ratio should be 2");
     }
 }

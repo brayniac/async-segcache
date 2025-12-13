@@ -67,7 +67,7 @@ async fn run_benchmark(num_threads: usize) -> (u64, Duration) {
                 let key = generate_key(key_id);
 
                 // Perform get operation
-                let _ = cache.get(&key, &mut buffer);
+                let _ = cache.get(&key);
 
                 local_ops += 1;
                 counter += 1;
@@ -133,7 +133,7 @@ async fn run_latency_benchmark(num_threads: usize) -> Vec<Duration> {
 
                 // Measure latency
                 let start = Instant::now();
-                let _ = cache.get(&key, &mut buffer);
+                let _ = cache.get(&key);
                 let latency = start.elapsed();
 
                 local_samples.push(latency);

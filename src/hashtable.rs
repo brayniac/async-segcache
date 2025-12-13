@@ -104,17 +104,21 @@ impl Hashtable {
 
                 // Verify the key actually matches by reading from segment
                 if self.verify_key(key, segment_id, offset, segments) {
-                    // TODO: Update frequency using ASFC algorithm when we implement LFU eviction
-                    // Currently disabled as none of our eviction policies use frequency
-                    // let new_packed = Hashbucket::update_freq(packed);
-                    // if new_packed != packed {
-                    //     let _ = slot.compare_exchange(
-                    //         packed,
-                    //         new_packed,
-                    //         Ordering::Release,
-                    //         Ordering::Relaxed,
-                    //     );
-                    // }
+                    // Update frequency using ASFC algorithm for frequency-based eviction
+                    // Skip update if frequency is already saturated (127) to avoid
+                    // unnecessary RNG calls and CAS contention on hot items
+                    let freq = Hashbucket::item_freq(packed);
+                    if freq < 127 {
+                        if let Some(new_packed) = Hashbucket::try_update_freq(packed, freq) {
+                            // Best-effort update - if CAS fails, another thread updated it
+                            let _ = slot.compare_exchange(
+                                packed,
+                                new_packed,
+                                Ordering::Release,
+                                Ordering::Relaxed,
+                            );
+                        }
+                    }
 
                     return Some((segment_id, offset));
                 }
@@ -301,7 +305,10 @@ impl Hashtable {
         // Check if we have a slot available
         let (mut slot_idx, mut expected_value) = match target_slot_info {
             Some(info) => info,
-            None => return Err(()), // Bucket full, no empty slots
+            None => {
+                cache.metrics().hashtable_full.increment();
+                return Err(()); // Bucket full, no empty slots
+            }
         };
 
         // Extract old location if we're replacing an existing entry
@@ -317,7 +324,10 @@ impl Hashtable {
         // STEP 2: Append item to segment ONCE (no lock held)
         let (segment_id, offset) = match cache.ttl_buckets().append_item(cache, key, value, optional, ttl).await {
             Some(result) => result,
-            None => return Err(()), // Out of memory
+            None => {
+                cache.metrics().segment_alloc_fail.increment();
+                return Err(()); // Out of memory
+            }
         };
 
         // STEP 3: Try to CAS link into a slot - retry with different slots if we lose
@@ -409,14 +419,18 @@ impl Hashtable {
     /// - `Ok(None)` if item was successfully linked with no replacement
     /// - `Ok(Some((old_seg_id, old_offset)))` if successfully linked and replaced existing item
     /// - `Err(())` if insertion failed (bucket full)
-    #[cfg(test)] // Used internally and in tests
     pub(crate) fn link_item(&self, key: &[u8], segment_id: u32, offset: u32, segments: &crate::segments::Segments, metrics: &crate::metrics::CacheMetrics) -> Result<Option<(u32, u32)>, ()> {
         // Validate segment_id and offset fit in their bit fields
+        // Offset is stored as offset/8 (20 bits), so max is 0xFFFFF * 8 = 8,388,600
         if segment_id > 0xFFFFFF {
             panic!("segment_id {} exceeds 24-bit limit", segment_id);
         }
-        if offset > 0xFFFFF {
-            panic!("offset {} exceeds 20-bit limit", offset);
+        if offset > 0xFFFFF << 3 {
+            panic!("offset {} exceeds limit (max {})", offset, 0xFFFFF << 3);
+        }
+        // Offset must be 8-byte aligned
+        if offset & 0x7 != 0 {
+            panic!("offset {} is not 8-byte aligned", offset);
         }
 
         // Hash the key
@@ -704,7 +718,7 @@ impl Hashtable {
     ///
     /// # Loom Test Coverage
     /// - `hashtable_unlink_concurrent` - Two threads unlinking (empty table)
-    /// - Called by `evict_and_clear` which is tested indirectly via TTL bucket eviction
+    /// - Called by `clear` which is tested indirectly via TTL bucket eviction
     pub fn unlink_item(&self, key: &[u8], segment_id: u32, offset: u32, metrics: &crate::metrics::CacheMetrics) -> bool {
         // Hash the key
         let mut hasher = self.hash_builder.build_hasher();
@@ -761,6 +775,68 @@ impl Hashtable {
         metrics.item_unlink_not_found.increment();
         false
     }
+
+    /// Update the location of an item in the hashtable without changing its frequency.
+    ///
+    /// Used during segment compaction where an item is moved within the same segment.
+    /// The tag and frequency are preserved, only the offset is updated.
+    ///
+    /// # Parameters
+    /// - `key`: The key to update
+    /// - `segment_id`: The segment ID (must match existing entry)
+    /// - `old_offset`: The current offset (must match for CAS to succeed)
+    /// - `new_offset`: The new offset within the segment (must fit in 20 bits)
+    ///
+    /// # Returns
+    /// `true` if the update succeeded, `false` if item not found or changed
+    pub fn update_item_location(&self, key: &[u8], segment_id: u32, old_offset: u32, new_offset: u32) -> bool {
+        // Validate new offset fits (stored as offset/8 in 20 bits, so max is 0xFFFFF * 8)
+        if new_offset > 0xFFFFF << 3 {
+            return false;
+        }
+        // Offset must be 8-byte aligned
+        if new_offset & 0x7 != 0 {
+            return false;
+        }
+        // Hash the key
+        let mut hasher = self.hash_builder.build_hasher();
+        key.hash(&mut hasher);
+        let hash = hasher.finish();
+
+        // Find primary bucket
+        let bucket_index = (hash & self.mask) as usize;
+        let tag = ((hash >> 32) & 0xFFF) as u16;
+
+        let bucket = &self.data[bucket_index];
+
+        // Search for existing entry with matching tag, segment_id, and old_offset
+        for slot in &bucket.items {
+            let packed = slot.load(Ordering::Acquire);
+
+            if packed == 0 {
+                continue;
+            }
+
+            if Hashbucket::item_tag(packed) == tag
+                && Hashbucket::item_segment_id(packed) == segment_id
+                && Hashbucket::item_offset(packed) == old_offset
+            {
+                // Found a matching entry - update the offset while preserving tag and frequency
+                let freq = Hashbucket::item_freq(packed);
+                let new_packed = Hashbucket::pack_item(tag, freq, segment_id, new_offset);
+
+                // CAS to update - if it fails, the item was modified concurrently
+                if slot
+                    .compare_exchange(packed, new_packed, Ordering::Release, Ordering::Acquire)
+                    .is_ok()
+                {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
 }
 
 pub struct Hashbucket {
@@ -802,12 +878,17 @@ impl Hashbucket {
     }
 
     /// Pack item information into a u64
-    /// Layout: [12 bits tag][8 bits freq][24 bits segment_id][20 bits offset]
+    /// Layout: [12 bits tag][8 bits freq][24 bits segment_id][20 bits offset/8]
+    ///
+    /// Since items are 8-byte aligned, we store offset/8 to get 8x more addressable space.
+    /// This allows offsets up to 8,388,600 bytes (~8MB) instead of ~1MB.
     pub fn pack_item(tag: u16, freq: u8, segment_id: u32, offset: u32) -> u64 {
+        // Offset must be 8-byte aligned
+        debug_assert!(offset & 0x7 == 0, "offset {} is not 8-byte aligned", offset);
         let tag_64 = (tag as u64 & 0xFFF) << 52;
         let freq_64 = (freq as u64 & 0xFF) << 44;
         let seg_64 = (segment_id as u64 & 0xFFFFFF) << 20;
-        let off_64 = offset as u64 & 0xFFFFF;
+        let off_64 = (offset >> 3) as u64 & 0xFFFFF; // Store offset/8
         tag_64 | freq_64 | seg_64 | off_64
     }
 
@@ -821,26 +902,47 @@ impl Hashbucket {
         ((packed >> 20) & 0xFFFFFF) as u32
     }
 
-    /// Extract offset from packed item (20 bits)
+    /// Extract offset from packed item (20 bits stored, multiplied by 8)
+    ///
+    /// Since we store offset/8, we multiply by 8 to get the actual offset.
     pub fn item_offset(packed: u64) -> u32 {
-        (packed & 0xFFFFF) as u32
+        ((packed & 0xFFFFF) << 3) as u32 // Return offset * 8
     }
 
     /// Extract frequency from packed item (8 bits)
-    #[cfg(test)] // Part of ASFC frequency tracking (currently disabled, may be re-enabled)
     pub(crate) fn item_freq(packed: u64) -> u8 {
         ((packed >> 44) & 0xFF) as u8
     }
 
     /// Update frequency in packed item using ASFC algorithm
     /// Returns new packed value with updated frequency
-    #[cfg(test)] // Part of ASFC frequency tracking (currently disabled, may be re-enabled)
+    #[cfg(test)]
     pub(crate) fn update_freq(packed: u64) -> u64 {
-        let mut freq = Self::item_freq(packed);
+        let freq = Self::item_freq(packed);
+        Self::try_update_freq(packed, freq).unwrap_or(packed)
+    }
 
+    /// Try to update frequency using ASFC algorithm.
+    /// Returns Some(new_packed) if frequency should be incremented, None otherwise.
+    ///
+    /// This avoids RNG calls for hot items by using probabilistic increment:
+    /// - Cold items (freq <= 16): Always increment
+    /// - Hot items (freq > 16): Increment with probability 1/freq
+    ///
+    /// The caller should check freq < 127 before calling to avoid unnecessary work.
+    pub(crate) fn try_update_freq(packed: u64, freq: u8) -> Option<u64> {
         // ASFC: Adaptive Software Frequency Counter
-        // Frequencies saturate at 127 to prevent overflow
-        if freq < 127 {
+        // Caller should ensure freq < 127, but double-check
+        if freq >= 127 {
+            return None;
+        }
+
+        // Probabilistic increment:
+        // - Always increment if freq <= 16 (cold items)
+        // - For freq > 16, increment with probability 1/freq (hot items increment slower)
+        let should_increment = if freq <= 16 {
+            true
+        } else {
             // Use thread-local RNG for better performance
             #[cfg(not(feature = "loom"))]
             let rand = {
@@ -851,17 +953,17 @@ impl Hashbucket {
             #[cfg(feature = "loom")]
             let rand = 0u64; // Deterministic for loom tests
 
-            // Probabilistic increment:
-            // - Always increment if freq <= 16 (cold items)
-            // - For freq > 16, increment with probability 1/freq (hot items increment slower)
-            if freq <= 16 || rand % (freq as u64) == 0 {
-                freq += 1;
-            }
-        }
+            rand % (freq as u64) == 0
+        };
 
-        // Clear old freq bits and set new freq
-        let freq_mask = 0xFF_u64 << 44;
-        (packed & !freq_mask) | ((freq as u64) << 44)
+        if should_increment {
+            let new_freq = freq + 1;
+            // Clear old freq bits and set new freq
+            let freq_mask = 0xFF_u64 << 44;
+            Some((packed & !freq_mask) | ((new_freq as u64) << 44))
+        } else {
+            None
+        }
     }
 }
 
@@ -981,14 +1083,14 @@ mod tests {
         let bucket_index = (hash & hashtable.mask) as usize;
         let tag = ((hash >> 32) & 0xFFF) as u16;
 
-        // Fill all 7 slots with items
+        // Fill all 7 slots with items (using 8-byte aligned offsets)
         for i in 0..7 {
-            let packed = Hashbucket::pack_item(tag, (i + 1) as u8, seg_id, (i * 100) as u32);
+            let packed = Hashbucket::pack_item(tag, (i + 1) as u8, seg_id, (i * 128) as u32);
             hashtable.data[bucket_index].items[i as usize].store(packed, Ordering::Release);
         }
 
         // Now try to link a new item - should fail because bucket is full
-        let result = hashtable.link_item(test_key, seg_id, 999, &segments, &metrics);
+        let result = hashtable.link_item(test_key, seg_id, 1024, &segments, &metrics);
         assert!(result.is_err(), "link_item should fail when bucket is full");
 
         // Verify the new item is NOT in the bucket (all 7 slots should still have original items)
@@ -996,7 +1098,7 @@ mod tests {
         for (i, slot) in hashtable.data[bucket_index].items.iter().enumerate() {
             let packed = slot.load(Ordering::Acquire);
             assert_ne!(packed, 0, "Slot {} should still be occupied", i);
-            assert_ne!(Hashbucket::item_offset(packed), 999, "New item should not be in slot {}", i);
+            assert_ne!(Hashbucket::item_offset(packed), 1024, "New item should not be in slot {}", i);
             count += 1;
         }
         assert_eq!(count, 7, "All 7 slots should still be occupied");
@@ -1020,8 +1122,9 @@ mod tests {
         let segments = SegmentsBuilder::new().build();
         let metrics = CacheMetrics::new();
 
-        // offset is 20 bits, max is 0xFFFFF
-        let _ = hashtable.link_item(b"key", 0, 0x100000, &segments, &metrics);
+        // offset is stored as offset/8 in 20 bits, so max is 0xFFFFF * 8 = 8,388,600
+        // Use an offset that exceeds this limit (and is 8-byte aligned)
+        let _ = hashtable.link_item(b"key", 0, 0x800008, &segments, &metrics);
     }
 
     #[test]
@@ -1053,7 +1156,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
     fn test_asfc_frequency_tracking() {
         // Test that ASFC frequency tracking works on get operations
         let hashtable = Hashtable::new(4);
@@ -1101,8 +1203,8 @@ mod tests {
 
     #[test]
     fn test_asfc_frequency_saturation() {
-        // Test that frequency saturates at 127
-        let packed = Hashbucket::pack_item(100, 127, 1, 1000);
+        // Test that frequency saturates at 127 (using 8-byte aligned offset)
+        let packed = Hashbucket::pack_item(100, 127, 1, 1024);
         assert_eq!(Hashbucket::item_freq(packed), 127);
 
         // Updating a saturated frequency should not change it
@@ -1112,8 +1214,8 @@ mod tests {
 
     #[test]
     fn test_asfc_update_freq() {
-        // Test the update_freq function directly
-        let packed = Hashbucket::pack_item(100, 5, 1, 1000);
+        // Test the update_freq function directly (using 8-byte aligned offset)
+        let packed = Hashbucket::pack_item(100, 5, 1, 1024);
         assert_eq!(Hashbucket::item_freq(packed), 5);
 
         // For freq <= 16, ASFC always increments
@@ -1124,6 +1226,6 @@ mod tests {
         // Verify other fields unchanged
         assert_eq!(Hashbucket::item_tag(updated), 100);
         assert_eq!(Hashbucket::item_segment_id(updated), 1);
-        assert_eq!(Hashbucket::item_offset(updated), 1000);
+        assert_eq!(Hashbucket::item_offset(updated), 1024);
     }
 }

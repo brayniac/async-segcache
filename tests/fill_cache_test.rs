@@ -66,7 +66,7 @@ async fn test_fill_with_value_size(value_size: usize) {
 
     for i in 0..std::cmp::min(100, success_count) {
         let key = format!("key_{:020}", i);
-        if cache.get(key.as_bytes(), &mut buffer).is_ok() {
+        if cache.get(key.as_bytes()).is_ok() {
             read_success += 1;
         }
     }
@@ -326,7 +326,7 @@ async fn test_production_scenario() {
     let mut read_success = 0;
     for i in 0..100 {
         let key = format!("key:{:010}", i);
-        if cache.get(key.as_bytes(), &mut buffer).is_ok() {
+        if cache.get(key.as_bytes()).is_ok() {
             read_success += 1;
         }
     }
@@ -439,7 +439,7 @@ async fn test_eviction_stress() {
     // Check the last 100 keys written (most likely to still be in cache)
     for i in (key_space - 100)..key_space {
         let key = format!("evict_test_key:{:010}", i);
-        if cache.get(key.as_bytes(), &mut buffer).is_ok() {
+        if cache.get(key.as_bytes()).is_ok() {
             read_success += 1;
         }
     }

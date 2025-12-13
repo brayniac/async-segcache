@@ -5,7 +5,7 @@ mod loom_tests {
     use loom::thread;
 
     /// Helper to get metric values
-    fn get_metric_value(metric: &metriken::Counter) -> u64 {
+    fn get_metric_value(metric: &crate::metrics::Counter) -> u64 {
         metric.value()
     }
 

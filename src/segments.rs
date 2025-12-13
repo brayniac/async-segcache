@@ -187,23 +187,40 @@ impl Segments {
     /// - `true` if segment was successfully cleared and is now in Reserved state
     /// - `false` if segment is not in Locked state
     ///
+    /// Clear a segment by unlinking all items from the hashtable and resetting statistics.
+    ///
+    /// This is the single clearing primitive for segments. It:
+    /// - Expects segment in Locked state with chain links already cleared
+    /// - Iterates through all items and unlinks non-deleted items from hashtable
+    /// - Resets segment statistics (write_offset, live_items, live_bytes)
+    /// - Transitions segment from Locked to Reserved
+    ///
+    /// # Metrics
+    /// This function does NOT update global item/byte metrics (items_live, bytes_live).
+    /// The caller is responsible for updating those based on the return value.
+    ///
+    /// # Returns
+    /// - `Some((items_cleared, bytes_cleared))` on success - the count and size of live
+    ///   items that were cleared (does not include already-deleted items)
+    /// - `None` if clearing failed (wrong state, bounds error)
+    ///
     /// # Panics
-    /// - If the segment has chain links (must be unlinked from TTL bucket first)
+    /// - If segment has chain links (must be unlinked from TTL bucket first)
     /// - If segment data is corrupted
     /// - If state transition from Locked to Reserved fails
-    pub fn evict_and_clear(&self, id: u32, hashtable: &Hashtable, metrics: &crate::metrics::CacheMetrics) -> bool {
+    pub fn clear(&self, id: u32, hashtable: &Hashtable, metrics: &crate::metrics::CacheMetrics) -> Option<(u32, u64)> {
         let id_usize = id as usize;
 
         // Bounds check
         if id_usize >= self.segments.len() {
-            return false;
+            return None;
         }
 
         let segment = &self.segments[id_usize];
 
-        // Segment must be in Locked state (prepared by TTL bucket eviction)
+        // Segment must be in Locked state (prepared by caller)
         if segment.state() != SegmentState::Locked {
-            return false;
+            return None;
         }
 
         // Verify segment has been unlinked from TTL bucket chains
@@ -213,7 +230,7 @@ impl Segments {
         let prev_cleared = prev.is_none() || prev == Some(INVALID_SEGMENT_ID);
         if !next_cleared || !prev_cleared {
             panic!(
-                "Segment {} still has chain links during evict_and_clear (next={:?}, prev={:?}) - must be unlinked first",
+                "Segment {} still has chain links during clear (next={:?}, prev={:?}) - must be unlinked first",
                 id, next, prev
             );
         }
@@ -221,6 +238,8 @@ impl Segments {
         // Clear all items in the segment, removing them from the hashtable
         let mut current_offset = 0u32;
         let write_offset = segment.write_offset.load(Ordering::Acquire);
+        let mut items_cleared = 0u32;
+        let mut bytes_cleared = 0u64;
 
         // Synchronize with append_item's Release fence
         fence(Ordering::Acquire);
@@ -266,6 +285,10 @@ impl Segments {
                 } else {
                     metrics.item_unlink_not_found.increment();
                 }
+
+                // Track what we cleared (caller updates global metrics)
+                items_cleared += 1;
+                bytes_cleared += item_size as u64;
             }
 
             current_offset += item_size;
@@ -286,342 +309,7 @@ impl Segments {
         );
 
         metrics.segment_clear.increment();
-        true
-    }
-
-    /// Clear all items from a segment and return it to the free pool.
-    ///
-    /// This function safely removes all items from the segment by:
-    /// 1. Transitioning the segment to Draining state
-    /// 2. Iterating through all items and unlinking them from the hashtable
-    /// 3. Waiting for all readers to finish
-    /// 4. Resetting the segment and returning it to the free pool
-    ///
-    /// # Safety
-    ///
-    /// This operation is safe because:
-    /// - Items are marked as deleted before being unlinked from hashtable
-    /// - Reference counting ensures no readers access the segment during cleanup
-    /// - State transitions prevent new readers from entering
-    ///
-    /// Clear a segment by unlinking all items and resetting statistics.
-    ///
-    /// This is the core primitive for segment clearing that handles all concurrency safety:
-    /// - Transitions segment to Locked state (via Draining if needed)
-    /// - Unlinks all items from the hashtable
-    /// - Resets segment statistics
-    /// - Leaves segment in Locked state for caller to decide final disposition
-    ///
-    /// Callers should use:
-    /// - `expire()` to clear and return segment to free pool
-    /// - `evict()` to clear and reuse segment immediately (memory pressure)
-    ///
-    /// # Returns
-    /// - `true` if segment was successfully cleared and is now in Locked state
-    /// - `false` if segment couldn't be cleared (already being cleared by another thread)
-    ///
-    /// # Concurrent Safety
-    /// Multiple threads can safely call this concurrently on the same segment.
-    /// Only one will succeed in clearing; others will detect the race and return false.
-    pub fn clear(&self, id: u32, cache: &impl CacheOps) -> bool {
-        let id_usize = id as usize;
-
-        // Bounds check
-        if id_usize >= self.segments.len() {
-            return false;
-        }
-
-        let segment = &self.segments[id_usize];
-
-        // Step 1: Transition segment to Draining state
-        // This prevents new readers from entering while allowing existing ones to finish
-        let initial_state = segment.state();
-
-        // Check if segment is already being cleared or is already clear
-        let need_state_transition = match initial_state {
-            SegmentState::Free => {
-                // Segment is already cleared
-                return false;
-            }
-            SegmentState::Draining => {
-                // Another thread is already clearing - they're transitioning to Locked
-                return false;
-            }
-            SegmentState::Locked => {
-                // Segment is already in Locked state - another thread owns it
-                // (either clearing it or in eviction path)
-                return false;
-            }
-            SegmentState::Reserved => {
-                // Check if segment is already empty (already cleared by another thread)
-                // A cleared segment will have: write_offset=0, no links, and be in Reserved state
-                if segment.write_offset.load(Ordering::Acquire) == 0
-                    && segment.next() == Some(INVALID_SEGMENT_ID)
-                    && segment.prev() == Some(INVALID_SEGMENT_ID) {
-                    // Segment is already cleared, nothing to do
-                    return false;
-                }
-                // Proceed with clear attempt
-                true
-            }
-            _ => {
-                // Need to transition to Locked state
-                true
-            }
-        };
-
-        // Transition to Draining state if needed
-        if need_state_transition {
-            // Use None for next/prev to preserve current values atomically
-            // (avoids TOCTOU race where another thread modifies links between our loads)
-            if !segment.cas_metadata(
-                initial_state,
-                SegmentState::Draining,
-                None, // Preserve current next
-                None, // Preserve current prev
-                cache.metrics(),
-            ) {
-                // CAS failed - state changed concurrently
-                // Check if segment is already empty (was cleared by another thread)
-                if segment.write_offset.load(Ordering::Acquire) == 0 {
-                    // Segment was cleared by another thread, don't proceed
-                    return false;
-                }
-                // State changed to something else - another thread is handling it
-                return false;
-            }
-        }
-
-        // Step 2: Iterate through all items in the segment
-        let mut current_offset = 0u32;
-        let mut _unlinked_count = 0u32;
-        let write_limit = segment.write_offset.load(Ordering::Acquire);
-
-        while current_offset < write_limit {
-            // Ensure we have space for at least the header
-            if current_offset + ItemHeader::SIZE as u32 > segment.data_len {
-                break;
-            }
-
-            let data_ptr = unsafe { segment.data.as_ptr().add(current_offset as usize) };
-            let header = ItemHeader::from_bytes(unsafe {
-                std::slice::from_raw_parts(data_ptr, ItemHeader::SIZE)
-            });
-
-            // Calculate the full item size including padding
-            let item_size = header.padded_size() as u32;
-
-            // Ensure the full item fits within the segment
-            if current_offset + item_size > segment.data_len {
-                break;
-            }
-
-            // Step 3: Process the item if it's not already deleted
-            if !header.is_deleted() {
-                // Extract the key for hashtable unlinking
-                let raw_item =
-                    unsafe { std::slice::from_raw_parts(data_ptr, header.padded_size()) };
-
-                let key_start = ItemHeader::SIZE + header.optional_len() as usize;
-                let key_end = key_start + header.key_len() as usize;
-                let key = &raw_item[key_start..key_end];
-
-                // First, mark the item as deleted in the segment
-                // This is safe because we're in Draining state
-                let flags_ptr = unsafe { data_ptr.add(4) };
-
-                // Use the same loom-compatible approach as mark_deleted
-                #[cfg(not(feature = "loom"))]
-                {
-                    let flags_atomic = unsafe { &*(flags_ptr as *const AtomicU8) };
-                    flags_atomic.fetch_or(0x40, Ordering::Release);
-                }
-
-                #[cfg(feature = "loom")]
-                {
-                    let old_val = unsafe { std::ptr::read_volatile(flags_ptr) };
-                    if (old_val & 0x40) == 0 {
-                        fence(Ordering::Release);
-                        unsafe { std::ptr::write_volatile(flags_ptr, old_val | 0x40) };
-                    }
-                }
-
-                // Then unlink from hashtable
-                if cache.hashtable().unlink_item(key, id, current_offset, cache.metrics()) {
-                    _unlinked_count += 1;
-                }
-            }
-
-            // Move to the next item
-            current_offset += item_size;
-        }
-
-        // Step 4: Wait for all readers to finish (only if we transitioned through Draining)
-        if need_state_transition {
-            // Aggressive bounded spinning - no yields for async compatibility
-            #[cfg(not(feature = "loom"))]
-            {
-                const MAX_SPINS: u32 = 100_000;
-                let mut spin_count = 0;
-
-                while segment.ref_count.load(Ordering::Acquire) > 0 {
-                    if spin_count >= MAX_SPINS {
-                        // Readers taking too long - abort eviction
-                        // Transition back to original state
-                        segment.cas_metadata(
-                            SegmentState::Draining,
-                            SegmentState::Live, // or Sealed, but we'll use Live as safe fallback
-                            None,
-                            None,
-                            cache.metrics(),
-                        );
-                        return false;
-                    }
-
-                    // Exponential backoff: 1 spin for first 10k, then 2 spins
-                    if spin_count < 10_000 {
-                        spin_loop();
-                    } else {
-                        spin_loop();
-                        spin_loop();
-                    }
-                    spin_count += 1;
-                }
-            }
-
-            #[cfg(feature = "loom")]
-            {
-                // In loom, we can't spin like this - check once
-                if segment.ref_count.load(Ordering::Acquire) > 0 {
-                    panic!("Segment still has active readers in loom test");
-                }
-            }
-
-            // Step 5: Transition to Locked state for final cleanup
-            if !segment.cas_metadata(
-                SegmentState::Draining,
-                SegmentState::Locked,
-                None, // Preserve current next
-                None, // Preserve current prev
-                cache.metrics(),
-            ) {
-                panic!("Failed to lock segment for cleanup");
-            }
-        }
-
-        // Step 6: Reset segment statistics
-        segment.write_offset.store(0, Ordering::Release);
-        segment.live_items.store(0, Ordering::Release);
-        segment.live_bytes.store(0, Ordering::Release);
-        segment
-            .expire_at
-            .store(clocksource::coarse::Instant::now(), Ordering::Relaxed);
-        segment.clear_bucket_id();
-
-        // Step 7: Clear the segment's chain links if not already cleared
-        // In eviction path, links are already cleared by TTL bucket code
-        // Links are considered cleared if they're None or INVALID_SEGMENT_ID
-        let next = segment.next();
-        let prev = segment.prev();
-        let next_cleared = next.is_none() || next == Some(INVALID_SEGMENT_ID);
-        let prev_cleared = prev.is_none() || prev == Some(INVALID_SEGMENT_ID);
-
-        if !next_cleared || !prev_cleared {
-            // Try to clear links while staying in Locked state
-            if !segment.cas_metadata(
-                SegmentState::Locked,
-                SegmentState::Locked,
-                Some(INVALID_SEGMENT_ID),
-                Some(INVALID_SEGMENT_ID),
-                cache.metrics(),
-            ) {
-                // CAS failed - verify links are now cleared
-                let next_now = segment.next();
-                let prev_now = segment.prev();
-                let next_cleared_now = next_now.is_none() || next_now == Some(INVALID_SEGMENT_ID);
-                let prev_cleared_now = prev_now.is_none() || prev_now == Some(INVALID_SEGMENT_ID);
-
-                if !next_cleared_now || !prev_cleared_now {
-                    // Links still not cleared - this is corruption
-                    panic!(
-                        "Failed to clear segment {} links and they're still not cleared (next={:?}, prev={:?})",
-                        id, next_now, prev_now
-                    );
-                }
-                // Links were cleared by another thread, continue
-            }
-        }
-
-        // Segment is now cleared and in Locked state
-        // Caller can either release() it or transition to Live for reuse
-        true
-    }
-
-    /// Expire a segment by clearing it and returning it to the free pool.
-    ///
-    /// Used for TTL expiration. Clears the segment and makes it available for
-    /// future allocations.
-    ///
-    /// # Process
-    /// 1. Calls `clear()` to unlink items and transition to Locked state
-    /// 2. Transitions Locked → Reserved
-    /// 3. Calls `release()` to add segment back to free pool
-    ///
-    /// # Returns
-    /// - `true` if segment was successfully expired
-    /// - `false` if segment couldn't be cleared (already being processed by another thread)
-    ///
-    /// # Note
-    /// Superseded by `TtlBucket::try_expire_head_segment()` for production use.
-    /// Kept for test compatibility.
-    #[cfg(test)] // Test-only function
-    pub(crate) fn expire(&self, id: u32, cache: &impl CacheOps) -> bool {
-        // Clear the segment (leaves it in Locked state)
-        if !self.clear(id, cache) {
-            return false;
-        }
-
-        // Get the segment reference
-        let segment = match self.get(id) {
-            Some(seg) => seg,
-            None => return false,
-        };
-
-        // Transition from Locked to Reserved
-        if !segment.cas_metadata(
-            SegmentState::Locked,
-            SegmentState::Reserved,
-            None, // Links already cleared by clear()
-            None,
-            cache.metrics(),
-        ) {
-            // This shouldn't happen - we own the segment in Locked state
-            panic!("Failed to transition cleared segment {} from Locked to Reserved", id);
-        }
-
-        // Return segment to free pool
-        self.release(id, cache.metrics());
-        true
-    }
-
-    /// Evict a segment by clearing it for immediate reuse.
-    ///
-    /// Used during memory pressure to reclaim and reuse a segment immediately
-    /// rather than returning it to the free pool.
-    ///
-    /// # Process
-    /// 1. Calls `clear()` to unlink items and transition to Locked state
-    /// 2. Leaves segment in Locked state for caller to provision
-    ///
-    /// # Returns
-    /// - `true` if segment was successfully cleared and is ready for reuse
-    /// - `false` if segment couldn't be cleared
-    ///
-    /// # Note
-    /// Caller is responsible for transitioning the segment from Locked to Live
-    /// when provisioning it for reuse.
-    pub fn evict(&self, id: u32, cache: &impl CacheOps) -> bool {
-        self.clear(id, cache)
+        Some((items_cleared, bytes_cleared))
     }
 
     /// Mark an item as deleted in a specific segment.
@@ -1133,6 +821,11 @@ impl<'a> Segment<'a> {
         self.data_len as usize
     }
 
+    /// Get the current write offset (amount of data written) in the segment
+    pub fn current_write_offset(&self) -> u32 {
+        self.write_offset.load(Ordering::Acquire)
+    }
+
     /// Get a pointer to the segment's data region
     ///
     /// # Safety
@@ -1510,6 +1203,86 @@ impl<'a> Segment<'a> {
         }
     }
 
+    /// Append an item to this segment without updating global metrics.
+    /// Used during merge/copy operations where the item already exists elsewhere.
+    /// Only updates segment-local statistics, not cache-wide metrics.
+    pub(crate) fn append_item_no_global_metrics(&self, key: &[u8], value: &[u8], optional: &[u8], metrics: &crate::metrics::CacheMetrics) -> Option<u32> {
+        if key.is_empty() || key.len() > ItemHeader::MAX_KEY_LEN {
+            return None;
+        }
+        if optional.len() > ItemHeader::MAX_OPTIONAL_LEN {
+            return None;
+        }
+        if value.len() > ItemHeader::MAX_VALUE_LEN {
+            return None;
+        }
+
+        let header = ItemHeader::new(
+            key.len() as u8,
+            optional.len() as u8,
+            value.len() as u32,
+            false,
+            false,
+        );
+
+        let item_size = header.padded_size() as u32;
+        if item_size > self.data_len {
+            return None;
+        }
+
+        // Reserve space
+        let reserved_offset = match retry_cas_u32(
+            &self.write_offset,
+            |current_offset| {
+                let new_offset = current_offset.saturating_add(item_size);
+                if new_offset > self.data_len {
+                    return None;
+                }
+                Some((new_offset, current_offset))
+            },
+            CasRetryConfig {
+                max_attempts: 16,
+                early_spin_threshold: 4,
+            },
+            metrics,
+        ) {
+            CasResult::Success(offset) => offset,
+            CasResult::Failed(_) | CasResult::Aborted => return None,
+        };
+
+        // Write the data
+        {
+            let mut data_ptr = unsafe { self.data.as_ptr().add(reserved_offset as usize) };
+
+            // Write header
+            {
+                let data = unsafe { std::slice::from_raw_parts_mut(data_ptr, ItemHeader::SIZE) };
+                header.to_bytes(data);
+            }
+
+            unsafe {
+                data_ptr = data_ptr.add(ItemHeader::SIZE);
+                if !optional.is_empty() {
+                    std::ptr::copy_nonoverlapping(optional.as_ptr(), data_ptr, optional.len());
+                    data_ptr = data_ptr.add(optional.len());
+                }
+                std::ptr::copy_nonoverlapping(key.as_ptr(), data_ptr, key.len());
+                data_ptr = data_ptr.add(key.len());
+                if !value.is_empty() {
+                    std::ptr::copy_nonoverlapping(value.as_ptr(), data_ptr, value.len());
+                }
+            }
+
+            fence(Ordering::Release);
+
+            // Only update segment-local statistics, NOT global metrics
+            self.live_items.fetch_add(1, Ordering::Relaxed);
+            self.live_bytes.fetch_add(item_size, Ordering::Relaxed);
+
+            return Some(reserved_offset);
+        }
+    }
+
     pub fn get_item(
         &self,
         offset: u32,
@@ -1726,6 +1499,341 @@ impl<'a> Segment<'a> {
         metrics.bytes_live.sub(item_size as i64);
 
         Ok(true)
+    }
+
+    /// Prune low-frequency items from this segment during merge eviction.
+    ///
+    /// Walks through all items in the segment and marks items with frequency below
+    /// the threshold as deleted. Items at or above the threshold are retained.
+    ///
+    /// # Parameters
+    /// - `hashtable`: Reference to the hashtable for looking up item frequencies
+    /// - `threshold`: Minimum frequency required to survive (items below are pruned)
+    /// - `metrics`: Cache metrics for tracking pruned/retained counts
+    ///
+    /// # Returns
+    /// Tuple of (items_retained, items_pruned, bytes_retained, bytes_pruned)
+    ///
+    /// # Note
+    /// This method expects the segment to be in a state where items can be marked
+    /// as deleted (Live, Sealed, or Relinking). Items already marked as deleted
+    /// are skipped and counted as pruned.
+    pub fn prune(
+        &self,
+        hashtable: &crate::hashtable::Hashtable,
+        threshold: u8,
+        metrics: &crate::metrics::CacheMetrics,
+    ) -> (u32, u32, u32, u32) {
+        let mut items_retained = 0u32;
+        let mut items_pruned = 0u32;
+        let mut bytes_retained = 0u32;
+        let mut bytes_pruned = 0u32;
+
+        let mut current_offset = 0u32;
+        let write_offset = self.write_offset.load(Ordering::Acquire);
+
+        // Synchronize with append_item's Release fence
+        fence(Ordering::Acquire);
+
+        while current_offset < write_offset {
+            // Validate header fits within segment
+            if current_offset + ItemHeader::SIZE as u32 > self.data_len {
+                break;
+            }
+
+            let data_ptr = unsafe { self.data.as_ptr().add(current_offset as usize) };
+            let header = ItemHeader::from_bytes(unsafe {
+                std::slice::from_raw_parts(data_ptr, ItemHeader::SIZE)
+            });
+
+            let item_size = header.padded_size() as u32;
+
+            // Validate full item fits within segment
+            if current_offset + item_size > write_offset {
+                break;
+            }
+
+            // Skip already deleted items
+            if header.is_deleted() {
+                items_pruned += 1;
+                bytes_pruned += item_size;
+                current_offset += item_size;
+                continue;
+            }
+
+            // Extract the key to look up frequency in hashtable
+            let raw_item = unsafe { std::slice::from_raw_parts(data_ptr, header.padded_size()) };
+            let key_start = ItemHeader::SIZE + header.optional_len() as usize;
+            let key_end = key_start + header.key_len() as usize;
+            let key = &raw_item[key_start..key_end];
+
+            // Look up the item's frequency from the hashtable
+            let freq = self.get_item_frequency(hashtable, key, self.id, current_offset);
+
+            if freq >= threshold {
+                // Item survives - frequency is at or above threshold
+                items_retained += 1;
+                bytes_retained += item_size;
+            } else {
+                // Item is pruned - mark it as deleted and unlink from hashtable
+                let _ = self.mark_deleted(current_offset, key, metrics);
+                hashtable.unlink_item(key, self.id, current_offset, metrics);
+                items_pruned += 1;
+                bytes_pruned += item_size;
+                metrics.merge_evict_items_pruned.increment();
+            }
+
+            current_offset += item_size;
+        }
+
+        // Update merge eviction metrics
+        for _ in 0..items_retained {
+            metrics.merge_evict_items_retained.increment();
+        }
+
+        (items_retained, items_pruned, bytes_retained, bytes_pruned)
+    }
+
+    /// Get the frequency of an item from the hashtable.
+    ///
+    /// Looks up the item in the hashtable by key and extracts the frequency
+    /// from the packed hashtable entry. Returns 0 if the item is not found
+    /// or if there's a location mismatch (item was moved).
+    fn get_item_frequency(
+        &self,
+        hashtable: &crate::hashtable::Hashtable,
+        key: &[u8],
+        expected_seg_id: u32,
+        expected_offset: u32,
+    ) -> u8 {
+        use std::hash::{Hash, Hasher, BuildHasher};
+
+        // Hash the key to find its bucket
+        let mut hasher = hashtable.hash_builder.build_hasher();
+        key.hash(&mut hasher);
+        let hash = hasher.finish();
+
+        let bucket_index = (hash & hashtable.mask) as usize;
+        let tag = ((hash >> 32) & 0xFFF) as u16;
+
+        // Search the bucket for our item
+        let bucket = &hashtable.data[bucket_index];
+
+        for slot in &bucket.items {
+            let packed = slot.load(Ordering::Acquire);
+
+            if packed == 0 {
+                continue;
+            }
+
+            // Check if this entry matches our item
+            if crate::hashtable::Hashbucket::item_tag(packed) == tag {
+                let seg_id = crate::hashtable::Hashbucket::item_segment_id(packed);
+                let offset = crate::hashtable::Hashbucket::item_offset(packed);
+
+                // Verify this is the exact item we're looking for
+                if seg_id == expected_seg_id && offset == expected_offset {
+                    // Extract frequency (bits 44-51 in packed format)
+                    return ((packed >> 44) & 0xFF) as u8;
+                }
+            }
+        }
+
+        // Item not found in hashtable or moved - treat as low frequency
+        0
+    }
+
+    /// Compact this segment by moving all live items to the beginning.
+    ///
+    /// This eliminates gaps from deleted items, making space available at the end
+    /// of the segment for new items or items merged from other segments.
+    ///
+    /// # Parameters
+    /// - `hashtable`: Hashtable to update with new item locations
+    /// - `metrics`: Cache metrics for tracking operations
+    ///
+    /// # Returns
+    /// The new write_offset after compaction (where free space begins).
+    ///
+    /// # Safety
+    /// This function performs in-place memory moves. The caller must ensure
+    /// exclusive access to the segment during compaction.
+    pub fn compact(
+        &self,
+        hashtable: &crate::hashtable::Hashtable,
+        _metrics: &crate::metrics::CacheMetrics,
+    ) -> u32 {
+        let write_offset = self.write_offset.load(Ordering::Acquire);
+        fence(Ordering::Acquire);
+
+        // First pass: collect info about live items (offset and size)
+        let mut live_items: Vec<(u32, u32)> = Vec::new(); // (offset, size)
+        let mut current_offset = 0u32;
+
+        while current_offset < write_offset {
+            if current_offset + ItemHeader::SIZE as u32 > self.data_len {
+                break;
+            }
+
+            let data_ptr = unsafe { self.data.as_ptr().add(current_offset as usize) };
+            let header = ItemHeader::from_bytes(unsafe {
+                std::slice::from_raw_parts(data_ptr, ItemHeader::SIZE)
+            });
+
+            let item_size = header.padded_size() as u32;
+
+            if current_offset + item_size > write_offset {
+                break;
+            }
+
+            if !header.is_deleted() {
+                live_items.push((current_offset, item_size));
+            }
+
+            current_offset += item_size;
+        }
+
+        // Second pass: move items to the beginning, updating hashtable
+        let mut dest_offset = 0u32;
+
+        for (src_offset, item_size) in live_items {
+            if src_offset != dest_offset {
+                // Need to move this item
+                let src_ptr = unsafe { self.data.as_ptr().add(src_offset as usize) };
+                let dest_ptr = unsafe { self.data.as_ptr().add(dest_offset as usize) as *mut u8 };
+
+                // Extract key before moving (for hashtable update)
+                let header = ItemHeader::from_bytes(unsafe {
+                    std::slice::from_raw_parts(src_ptr, ItemHeader::SIZE)
+                });
+                let key_start = ItemHeader::SIZE + header.optional_len() as usize;
+                let key_end = key_start + header.key_len() as usize;
+                let key: Vec<u8> = unsafe {
+                    std::slice::from_raw_parts(src_ptr, item_size as usize)[key_start..key_end].to_vec()
+                };
+
+                // Move the item data
+                unsafe {
+                    std::ptr::copy(src_ptr, dest_ptr, item_size as usize);
+                }
+
+                // Update hashtable to point to new location (atomic offset update)
+                // Note: We use update_item_location which atomically updates the offset
+                // while preserving the tag and frequency. No unlinking needed since the
+                // item stays in the same segment, just moves to a different offset.
+                hashtable.update_item_location(&key, self.id, src_offset, dest_offset);
+            }
+
+            dest_offset += item_size;
+        }
+
+        // Update write_offset to reflect compacted size
+        self.write_offset.store(dest_offset, Ordering::Release);
+
+        dest_offset
+    }
+
+    /// Copy all live (non-deleted) items from this segment into a destination segment.
+    ///
+    /// Used during merge eviction to consolidate surviving items into fewer segments.
+    /// Items are appended to the destination in order. The hashtable is updated to
+    /// point to the new locations.
+    ///
+    /// # Parameters
+    /// - `dest`: Destination segment to copy items into
+    /// - `hashtable`: Hashtable to update with new item locations
+    /// - `metrics`: Cache metrics for tracking operations
+    ///
+    /// # Returns
+    /// Number of items successfully copied, or None if destination is full.
+    ///
+    /// # Note
+    /// - Source items are NOT marked as deleted - the caller should handle
+    ///   unlinking the source segment from the hashtable separately.
+    /// - This method expects both segments to be in appropriate states.
+    pub fn copy_live_items_into(
+        &self,
+        dest: &Segment<'_>,
+        hashtable: &crate::hashtable::Hashtable,
+        segments: &crate::segments::Segments,
+        dest_seg_id: u32,
+        metrics: &crate::metrics::CacheMetrics,
+    ) -> Option<u32> {
+        let mut items_copied = 0u32;
+        let mut current_offset = 0u32;
+        let write_offset = self.write_offset.load(Ordering::Acquire);
+
+        // Synchronize with append_item's Release fence
+        fence(Ordering::Acquire);
+
+        while current_offset < write_offset {
+            // Validate header fits within segment
+            if current_offset + ItemHeader::SIZE as u32 > self.data_len {
+                break;
+            }
+
+            let data_ptr = unsafe { self.data.as_ptr().add(current_offset as usize) };
+            let header = ItemHeader::from_bytes(unsafe {
+                std::slice::from_raw_parts(data_ptr, ItemHeader::SIZE)
+            });
+
+            let item_size = header.padded_size() as u32;
+
+            // Validate full item fits within segment
+            if current_offset + item_size > write_offset {
+                break;
+            }
+
+            // Skip deleted items
+            if header.is_deleted() {
+                current_offset += item_size;
+                continue;
+            }
+
+            // Extract item components
+            let raw_item = unsafe { std::slice::from_raw_parts(data_ptr, header.padded_size()) };
+            let optional_start = ItemHeader::SIZE;
+            let optional_end = optional_start + header.optional_len() as usize;
+            let key_start = optional_end;
+            let key_end = key_start + header.key_len() as usize;
+            let value_start = key_end;
+            let value_end = value_start + header.value_len() as usize;
+
+            let optional = &raw_item[optional_start..optional_end];
+            let key = &raw_item[key_start..key_end];
+            let value = &raw_item[value_start..value_end];
+
+            // Append to destination segment - this increments global metrics
+            match dest.append_item(key, value, optional, metrics) {
+                Some(new_offset) => {
+                    // Check if offset exceeds hashtable limit (stored as offset/8 in 20 bits)
+                    // Max offset is 0xFFFFF * 8 = 8,388,600 bytes
+                    if new_offset > 0xFFFFF << 3 {
+                        // Destination segment is effectively full for hashtable purposes
+                        return None;
+                    }
+                    // Update hashtable to point to new location
+                    // Use link_item which handles replacement of existing entries
+                    let _ = hashtable.link_item(key, dest_seg_id, new_offset, segments, metrics);
+
+                    // Mark the source item as deleted. This properly decrements the global metrics
+                    // (items_live, bytes_live) since the source item is being consumed.
+                    // The net effect is: append_item (+1) + mark_deleted (-1) = 0 change,
+                    // which is correct since we're moving, not duplicating.
+                    let _ = self.mark_deleted(current_offset, key, metrics);
+
+                    items_copied += 1;
+                }
+                None => {
+                    // Destination segment is full
+                    return None;
+                }
+            }
+
+            current_offset += item_size;
+        }
+
+        Some(items_copied)
     }
 }
 
@@ -2058,17 +2166,37 @@ mod tests {
         assert_eq!(segment.live_items(), 0);
     }
 
+    /// Helper to transition a segment to Locked state with cleared links for testing
+    fn prepare_segment_for_clear(segment: &Segment, metrics: &crate::metrics::CacheMetrics) {
+        let state = segment.state();
+        // First transition to Locked state
+        segment.cas_metadata(
+            state,
+            SegmentState::Locked,
+            Some(INVALID_SEGMENT_ID),
+            Some(INVALID_SEGMENT_ID),
+            metrics,
+        );
+    }
+
     #[test]
     fn test_clear_empty_segment() {
         let cache = Cache::new();
         let seg_id = cache.segments().reserve(cache.metrics()).unwrap();
+        let segment = cache.segments().get(seg_id).unwrap();
+
+        // Prepare segment for clearing
+        prepare_segment_for_clear(segment, cache.metrics());
 
         // Clear an empty segment
-        cache.segments().expire(seg_id, &cache);
+        let result = cache.segments().clear(seg_id, cache.hashtable(), cache.metrics());
+        assert!(result.is_some());
+        let (items, bytes) = result.unwrap();
+        assert_eq!(items, 0);
+        assert_eq!(bytes, 0);
 
-        // Segment should be back in Free state
-        let segment = cache.segments().get(seg_id).unwrap();
-        assert_eq!(segment.state(), SegmentState::Free);
+        // Segment should be in Reserved state (clear transitions Locked -> Reserved)
+        assert_eq!(segment.state(), SegmentState::Reserved);
         assert_eq!(segment.live_items(), 0);
         assert_eq!(segment.write_offset(), 0);
     }
@@ -2088,60 +2216,60 @@ mod tests {
         let write_offset_before = segment.write_offset();
         assert!(write_offset_before > 0);
 
-        // Clear the segment
-        cache.segments().expire(seg_id, &cache);
+        // Prepare segment for clearing
+        prepare_segment_for_clear(segment, cache.metrics());
 
-        // Segment should be cleared and back in Free state
-        assert_eq!(segment.state(), SegmentState::Free);
+        // Clear the segment
+        let result = cache.segments().clear(seg_id, cache.hashtable(), cache.metrics());
+        assert!(result.is_some());
+        let (items, bytes) = result.unwrap();
+        assert_eq!(items, 3);
+        assert!(bytes > 0);
+
+        // Segment should be cleared and in Reserved state
+        assert_eq!(segment.state(), SegmentState::Reserved);
         assert_eq!(segment.live_items(), 0);
         assert_eq!(segment.write_offset(), 0);
         assert_eq!(segment.bucket_id(), None);
     }
 
     #[test]
-    fn test_clear_already_free_segment() {
+    fn test_clear_wrong_state_returns_none() {
         let cache = Cache::new();
         let seg_id = cache.segments().reserve(cache.metrics()).unwrap();
 
-        // Release it back to free pool
-        cache.segments().release(seg_id, cache.metrics());
-
-        // Clear should be a no-op and return early
-        cache.segments().expire(seg_id, &cache);
+        // Segment is in Reserved state (not Locked) - clear should return None
+        let result = cache.segments().clear(seg_id, cache.hashtable(), cache.metrics());
+        assert!(result.is_none());
 
         let segment = cache.segments().get(seg_id).unwrap();
-        assert_eq!(segment.state(), SegmentState::Free);
+        assert_eq!(segment.state(), SegmentState::Reserved);
     }
 
     #[test]
-    fn test_clear_from_live_state() {
-        // clear() should work from any state (except Free which returns early)
+    fn test_clear_from_locked_state() {
+        // clear() requires Locked state
         let cache = Cache::new();
         let seg_id = cache.segments().reserve(cache.metrics()).unwrap();
         let segment = cache.segments().get(seg_id).unwrap();
-
-        // Transition to Live state
-        segment.cas_metadata(
-            SegmentState::Reserved,
-            SegmentState::Live,
-            None,
-            None,
-            cache.metrics(),
-        );
 
         // Add an item
         segment.append_item(b"key", b"value", b"", cache.metrics()).unwrap();
 
-        // Clear should work from Live state
-        cache.segments().expire(seg_id, &cache);
+        // Transition to Locked state with cleared links
+        prepare_segment_for_clear(segment, cache.metrics());
 
-        // Segment should be cleared
-        assert_eq!(segment.state(), SegmentState::Free);
+        // Clear should work
+        let result = cache.segments().clear(seg_id, cache.hashtable(), cache.metrics());
+        assert!(result.is_some());
+
+        // Segment should be cleared and in Reserved state
+        assert_eq!(segment.state(), SegmentState::Reserved);
         assert_eq!(segment.live_items(), 0);
     }
 
     #[test]
-    fn test_clear_with_bucket_id() {
+    fn test_clear_clears_bucket_id() {
         let cache = Cache::new();
         let seg_id = cache.segments().reserve(cache.metrics()).unwrap();
         let segment = cache.segments().get(seg_id).unwrap();
@@ -2153,12 +2281,16 @@ mod tests {
         // Add an item
         segment.append_item(b"key", b"value", b"", cache.metrics()).unwrap();
 
+        // Prepare segment for clearing
+        prepare_segment_for_clear(segment, cache.metrics());
+
         // Clear the segment
-        cache.segments().expire(seg_id, &cache);
+        let result = cache.segments().clear(seg_id, cache.hashtable(), cache.metrics());
+        assert!(result.is_some());
 
         // Bucket ID should be cleared
         assert_eq!(segment.bucket_id(), None);
-        assert_eq!(segment.state(), SegmentState::Free);
+        assert_eq!(segment.state(), SegmentState::Reserved);
     }
 
     #[test]

@@ -82,7 +82,11 @@
       "Bash(timeout 60 cargo run:*)",
       "Bash(grep:*)",
       "Bash(python3:*)",
-      "Bash(git restore:*)"
+      "Bash(git restore:*)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "Bash(git fetch:*)"
     ],
     "deny": [],
     "ask": []

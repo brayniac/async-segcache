@@ -12,9 +12,9 @@ async fn test_proactive_expiration() {
 
     // Verify items are accessible
     let mut buffer = vec![0u8; 1024];
-    assert!(cache.get(b"key1", &mut buffer).is_ok());
-    assert!(cache.get(b"key2", &mut buffer).is_ok());
-    assert!(cache.get(b"key3", &mut buffer).is_ok());
+    assert!(cache.get(b"key1").is_ok());
+    assert!(cache.get(b"key2").is_ok());
+    assert!(cache.get(b"key3").is_ok());
 
     // Wait for expiration
     std::thread::sleep(Duration::from_secs(2));
@@ -24,9 +24,9 @@ async fn test_proactive_expiration() {
     println!("Expired {} segments", expired_count);
 
     // Items should now be gone
-    assert!(cache.get(b"key1", &mut buffer).is_err(), "key1 should be expired");
-    assert!(cache.get(b"key2", &mut buffer).is_err(), "key2 should be expired");
-    assert!(cache.get(b"key3", &mut buffer).is_err(), "key3 should be expired");
+    assert!(cache.get(b"key1").is_err(), "key1 should be expired");
+    assert!(cache.get(b"key2").is_err(), "key2 should be expired");
+    assert!(cache.get(b"key3").is_err(), "key3 should be expired");
 
     // Verify expiration metric was incremented
     assert!(cache.metrics().item_expire.value() > 0 || expired_count > 0,
@@ -54,10 +54,10 @@ async fn test_proactive_expiration_preserves_live_items() {
     let mut buffer = vec![0u8; 1024];
 
     // Short TTL items should be expired
-    assert!(cache.get(b"short1", &mut buffer).is_err());
-    assert!(cache.get(b"short2", &mut buffer).is_err());
+    assert!(cache.get(b"short1").is_err());
+    assert!(cache.get(b"short2").is_err());
 
     // Long TTL items should still be accessible
-    assert!(cache.get(b"long1", &mut buffer).is_ok());
-    assert!(cache.get(b"long2", &mut buffer).is_ok());
+    assert!(cache.get(b"long1").is_ok());
+    assert!(cache.get(b"long2").is_ok());
 }

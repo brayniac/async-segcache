@@ -15,14 +15,14 @@ async fn test_ttl_expiration() {
 
     // Should be able to get it immediately
     let mut buffer = vec![0u8; 1024];
-    let item = cache.get(key, &mut buffer).unwrap();
+    let item = cache.get(key).unwrap();
     assert_eq!(item.value(), value);
 
     // Wait for expiration
     thread::sleep(StdDuration::from_secs(2));
 
     // Should not be able to get it after expiration
-    let result = cache.get(key, &mut buffer);
+    let result = cache.get(key);
     assert!(result.is_err(), "Item should have expired");
 
     // Verify expiration metric was incremented
@@ -44,7 +44,7 @@ async fn test_ttl_no_expiration_without_ttl() {
 
     // Should still be able to get it
     let mut buffer = vec![0u8; 1024];
-    let item = cache.get(key, &mut buffer).unwrap();
+    let item = cache.get(key).unwrap();
     assert_eq!(item.value(), value);
 }
 
@@ -67,9 +67,9 @@ async fn test_ttl_expiration_multiple_items() {
     let mut buffer = vec![0u8; 1024];
 
     // Short TTL item should be expired
-    assert!(cache.get(b"short", &mut buffer).is_err());
+    assert!(cache.get(b"short").is_err());
 
     // Long TTL item should still be available
-    let item = cache.get(b"long", &mut buffer).unwrap();
+    let item = cache.get(b"long").unwrap();
     assert_eq!(item.value(), b"value2");
 }

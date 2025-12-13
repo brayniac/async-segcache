@@ -74,6 +74,10 @@ pub struct CacheMetrics {
     pub hashtable_link: Counter,
     pub hashtable_link_cas_failed: Counter,
     pub hashtable_evict: Counter,
+    pub hashtable_full: Counter,
+
+    // Segment allocation failures
+    pub segment_alloc_fail: Counter,
 
     // TTL bucket operations
     pub ttl_append_segment: Counter,
@@ -81,6 +85,14 @@ pub struct CacheMetrics {
     pub ttl_evict_head: Counter,
     pub ttl_evict_head_retry: Counter,
     pub ttl_evict_head_give_up: Counter,
+
+    // Merge eviction metrics
+    pub merge_evict: Counter,            // Number of merge eviction operations performed
+    pub merge_evict_segments: Counter,   // Total segments processed during merge eviction
+    pub merge_evict_items_pruned: Counter,   // Items pruned (dropped) during merge
+    pub merge_evict_items_retained: Counter, // Items retained during merge
+    pub merge_evict_bytes_pruned: Counter,   // Bytes pruned during merge
+    pub merge_evict_bytes_retained: Counter, // Bytes retained during merge
 
     // CAS contention metrics
     pub cas_retry: Counter,
@@ -112,11 +124,19 @@ impl CacheMetrics {
             hashtable_link: Counter::new(),
             hashtable_link_cas_failed: Counter::new(),
             hashtable_evict: Counter::new(),
+            hashtable_full: Counter::new(),
+            segment_alloc_fail: Counter::new(),
             ttl_append_segment: Counter::new(),
             ttl_append_segment_error: Counter::new(),
             ttl_evict_head: Counter::new(),
             ttl_evict_head_retry: Counter::new(),
             ttl_evict_head_give_up: Counter::new(),
+            merge_evict: Counter::new(),
+            merge_evict_segments: Counter::new(),
+            merge_evict_items_pruned: Counter::new(),
+            merge_evict_items_retained: Counter::new(),
+            merge_evict_bytes_pruned: Counter::new(),
+            merge_evict_bytes_retained: Counter::new(),
             cas_retry: Counter::new(),
             cas_abort: Counter::new(),
             segments_free: Gauge::new(),

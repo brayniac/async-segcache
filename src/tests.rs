@@ -132,12 +132,12 @@ mod loom_tests {
             // Two threads append items to the same segment
             let t1 = thread::spawn(move || {
                 let seg = c1.segments().get(seg_id).unwrap();
-                seg.append_item(b"key1", b"value1", b"", c1.metrics())
+                seg.append_item(b"key1", b"value1", b"", c1.metrics(), false)
             });
 
             let t2 = thread::spawn(move || {
                 let seg = c2.segments().get(seg_id).unwrap();
-                seg.append_item(b"key2", b"value2", b"", c2.metrics())
+                seg.append_item(b"key2", b"value2", b"", c2.metrics(), false)
             });
 
             let offset1 = t1.join().unwrap();
@@ -173,17 +173,17 @@ mod loom_tests {
             // This should cause CAS retries due to contention on write_offset
             let t1 = thread::spawn(move || {
                 let seg = c1.segments().get(seg_id).unwrap();
-                seg.append_item(b"k1", b"v1", b"", c1.metrics())
+                seg.append_item(b"k1", b"v1", b"", c1.metrics(), false)
             });
 
             let t2 = thread::spawn(move || {
                 let seg = c2.segments().get(seg_id).unwrap();
-                seg.append_item(b"k2", b"v2", b"", c2.metrics())
+                seg.append_item(b"k2", b"v2", b"", c2.metrics(), false)
             });
 
             let t3 = thread::spawn(move || {
                 let seg = c3.segments().get(seg_id).unwrap();
-                seg.append_item(b"k3", b"v3", b"", c3.metrics())
+                seg.append_item(b"k3", b"v3", b"", c3.metrics(), false)
             });
 
             let r1 = t1.join().unwrap();
@@ -229,11 +229,11 @@ mod loom_tests {
             let segment = cache.segments().get(seg_id).unwrap();
 
             // Fill the segment with a large value
-            let result1 = segment.append_item(b"key1", &[0u8; 64], b"", cache.metrics());
+            let result1 = segment.append_item(b"key1", &[0u8; 64], b"", cache.metrics(), false);
             assert!(result1.is_some(), "First insert should succeed");
 
             // Try to add another large value - should fail due to segment full
-            let result2 = segment.append_item(b"key2", &[0u8; 64], b"", cache.metrics());
+            let result2 = segment.append_item(b"key2", &[0u8; 64], b"", cache.metrics(), false);
 
             // The second insert should fail due to insufficient space
             assert!(result2.is_none(), "Second insert should fail due to full segment");
@@ -288,7 +288,7 @@ mod loom_tests {
             let segment = cache.segments().get(seg_id).unwrap();
 
             // Append an item
-            let offset = segment.append_item(b"key", b"value", b"", cache.metrics());
+            let offset = segment.append_item(b"key", b"value", b"", cache.metrics(), false);
             assert!(offset.is_some());
             assert_eq!(segment.live_items(), 1);
 
@@ -482,13 +482,13 @@ mod loom_tests {
             // Thread 1: Append an item
             let t1 = thread::spawn(move || {
                 let segment = c1.segments().get(seg_id).unwrap();
-                segment.append_item(b"key1", b"value1", b"", c1.metrics())
+                segment.append_item(b"key1", b"value1", b"", c1.metrics(), false)
             });
 
             // Thread 2: Append another item
             let t2 = thread::spawn(move || {
                 let segment = c2.segments().get(seg_id).unwrap();
-                segment.append_item(b"key2", b"value2", b"", c2.metrics())
+                segment.append_item(b"key2", b"value2", b"", c2.metrics(), false)
             });
 
             let offset1 = t1.join().unwrap();
@@ -530,7 +530,7 @@ mod loom_tests {
             let segment = cache.segments().get(seg_id).unwrap();
 
             // Append an item
-            let offset = segment.append_item(b"key", b"value", b"", cache.metrics()).unwrap();
+            let offset = segment.append_item(b"key", b"value", b"", cache.metrics(), false).unwrap();
 
             // Manually set up segment state
             segment.cas_metadata(
@@ -594,7 +594,7 @@ mod loom_tests {
             let segment = cache.segments().get(seg_id).unwrap();
 
             // Append an item
-            let offset = segment.append_item(b"key", b"value", b"", cache.metrics()).unwrap();
+            let offset = segment.append_item(b"key", b"value", b"", cache.metrics(), false).unwrap();
             assert_eq!(segment.live_items(), 1);
 
             let c1 = Arc::clone(&cache);
@@ -640,7 +640,7 @@ mod loom_tests {
             let segment = cache.segments().get(seg_id).unwrap();
 
             // Append an item
-            let offset = segment.append_item(b"key", b"value", b"", cache.metrics()).unwrap();
+            let offset = segment.append_item(b"key", b"value", b"", cache.metrics(), false).unwrap();
 
             let c1 = Arc::clone(&cache);
             let c2 = Arc::clone(&cache);
@@ -695,7 +695,7 @@ mod loom_tests {
             let segment = cache.segments().get(seg_id).unwrap();
 
             // Add an item so we have something to clear
-            segment.append_item(b"key", b"value", b"", cache.metrics()).unwrap();
+            segment.append_item(b"key", b"value", b"", cache.metrics(), false).unwrap();
 
             let c1 = Arc::clone(&cache);
             let c2 = Arc::clone(&cache);
@@ -733,7 +733,7 @@ mod loom_tests {
             // Reserve segment and append an item
             let seg_id = cache.segments().reserve(cache.metrics()).unwrap();
             let segment = cache.segments().get(seg_id).unwrap();
-            let offset = segment.append_item(b"concurrent_key", b"value", b"", cache.metrics()).unwrap();
+            let offset = segment.append_item(b"concurrent_key", b"value", b"", cache.metrics(), false).unwrap();
 
             // Manually insert into hashtable
             let mut hasher = (*cache.hashtable().hash_builder).build_hasher();
@@ -779,7 +779,7 @@ mod loom_tests {
             // Reserve segment and append an item
             let seg_id = cache.segments().reserve(cache.metrics()).unwrap();
             let segment = cache.segments().get(seg_id).unwrap();
-            let offset = segment.append_item(b"race_key", b"value", b"", cache.metrics()).unwrap();
+            let offset = segment.append_item(b"race_key", b"value", b"", cache.metrics(), false).unwrap();
 
             // Insert into hashtable
             let mut hasher = (*cache.hashtable().hash_builder).build_hasher();
@@ -826,8 +826,8 @@ mod loom_tests {
             let segment = cache.segments().get(seg_id).unwrap();
 
             // Create two items that will hash to the same bucket
-            let offset1 = segment.append_item(b"key1", b"value1", b"", cache.metrics()).unwrap();
-            let offset2 = segment.append_item(b"key2", b"value2", b"", cache.metrics()).unwrap();
+            let offset1 = segment.append_item(b"key1", b"value1", b"", cache.metrics(), false).unwrap();
+            let offset2 = segment.append_item(b"key2", b"value2", b"", cache.metrics(), false).unwrap();
 
             let c1 = Arc::clone(&cache);
             let c2 = Arc::clone(&cache);
@@ -864,7 +864,7 @@ mod loom_tests {
             let cache = Arc::new(Cache::new());
             let seg_id = cache.segments().reserve(cache.metrics()).unwrap();
             let segment = cache.segments().get(seg_id).unwrap();
-            let offset = segment.append_item(b"race_key", b"value", b"", cache.metrics()).unwrap();
+            let offset = segment.append_item(b"race_key", b"value", b"", cache.metrics(), false).unwrap();
 
             let c1 = Arc::clone(&cache);
             let c2 = Arc::clone(&cache);
@@ -903,7 +903,7 @@ mod loom_tests {
             let cache = Arc::new(Cache::new());
             let seg_id = cache.segments().reserve(cache.metrics()).unwrap();
             let segment = cache.segments().get(seg_id).unwrap();
-            let offset = segment.append_item(b"race_key", b"value", b"", cache.metrics()).unwrap();
+            let offset = segment.append_item(b"race_key", b"value", b"", cache.metrics(), false).unwrap();
 
             // Pre-insert the item into hashtable
             let mut hasher = (*cache.hashtable().hash_builder).build_hasher();
@@ -965,8 +965,8 @@ mod loom_tests {
             }
 
             // Now try to insert new items concurrently (will need eviction)
-            let offset1 = segment.append_item(b"new_key1", b"value1", b"", cache.metrics()).unwrap();
-            let offset2 = segment.append_item(b"new_key2", b"value2", b"", cache.metrics()).unwrap();
+            let offset1 = segment.append_item(b"new_key1", b"value1", b"", cache.metrics(), false).unwrap();
+            let offset2 = segment.append_item(b"new_key2", b"value2", b"", cache.metrics(), false).unwrap();
 
             let c1 = Arc::clone(&cache);
             let c2 = Arc::clone(&cache);

@@ -588,18 +588,48 @@ impl TtlBucket {
         );
 
         // AFTER successfully updating bucket head, update the next segment's prev pointer
+        // Use Relinking protocol to ensure atomic update without silent failures
         if let Some(next_id) = next_id {
             if let Some(next_segment) = cache.segments().get(next_id) {
-                // Try once to update prev pointer (retry loop moved to caller if needed)
-                let next_state = next_segment.state();
+                // Only update if prev still points to the evicted head
                 if next_segment.prev() == Some(head) {
-                    next_segment.cas_metadata(
-                        next_state,
-                        next_state,
-                        None,
-                        Some(INVALID_SEGMENT_ID),
-                        metrics,
-                    );
+                    // Retry loop to handle state changes (bounded)
+                    for _ in 0..8 {
+                        let next_state = next_segment.state();
+
+                        // Skip if segment is in a transient state
+                        if matches!(next_state, SegmentState::Draining | SegmentState::Locked | SegmentState::Relinking) {
+                            break; // Another operation is handling this segment
+                        }
+
+                        // Lock: (Live | Sealed) -> Relinking
+                        if next_segment.cas_metadata(
+                            next_state,
+                            SegmentState::Relinking,
+                            None,
+                            None,
+                            metrics,
+                        ) {
+                            // Update prev pointer while locked
+                            next_segment.cas_metadata(
+                                SegmentState::Relinking,
+                                SegmentState::Relinking,
+                                None,
+                                Some(INVALID_SEGMENT_ID),
+                                metrics,
+                            );
+                            // Unlock: Relinking -> original state
+                            next_segment.cas_metadata(
+                                SegmentState::Relinking,
+                                next_state,
+                                None,
+                                None,
+                                metrics,
+                            );
+                            break;
+                        }
+                        // CAS failed, state changed - retry with new state
+                    }
                 }
             }
         }
@@ -792,17 +822,48 @@ impl TtlBucket {
         );
 
         // Update the next segment's prev pointer
+        // Use Relinking protocol to ensure atomic update without silent failures
         if let Some(next_id) = next_id {
             if let Some(next_segment) = cache.segments().get(next_id) {
-                let next_state = next_segment.state();
+                // Only update if prev still points to the expired head
                 if next_segment.prev() == Some(head) {
-                    next_segment.cas_metadata(
-                        next_state,
-                        next_state,
-                        None,
-                        Some(INVALID_SEGMENT_ID),
-                        metrics,
-                    );
+                    // Retry loop to handle state changes (bounded)
+                    for _ in 0..8 {
+                        let next_state = next_segment.state();
+
+                        // Skip if segment is in a transient state
+                        if matches!(next_state, SegmentState::Draining | SegmentState::Locked | SegmentState::Relinking) {
+                            break; // Another operation is handling this segment
+                        }
+
+                        // Lock: (Live | Sealed) -> Relinking
+                        if next_segment.cas_metadata(
+                            next_state,
+                            SegmentState::Relinking,
+                            None,
+                            None,
+                            metrics,
+                        ) {
+                            // Update prev pointer while locked
+                            next_segment.cas_metadata(
+                                SegmentState::Relinking,
+                                SegmentState::Relinking,
+                                None,
+                                Some(INVALID_SEGMENT_ID),
+                                metrics,
+                            );
+                            // Unlock: Relinking -> original state
+                            next_segment.cas_metadata(
+                                SegmentState::Relinking,
+                                next_state,
+                                None,
+                                None,
+                                metrics,
+                            );
+                            break;
+                        }
+                        // CAS failed, state changed - retry with new state
+                    }
                 }
             }
         }
@@ -883,7 +944,7 @@ impl TtlBucket {
         &self,
         cache: &impl CacheOps,
         merge_ratio: usize,
-        _target_ratio: usize,
+        target_ratio: usize,
         metrics: &crate::metrics::CacheMetrics,
     ) -> Option<usize> {
         // We need at least 2 segments to merge (the destination + at least 1 source)
@@ -931,14 +992,29 @@ impl TtlBucket {
         let dest_seg_id = all_segments[0];
         let source_segments = &all_segments[1..];
 
-        // Calculate frequency threshold for pruning
-        // Use a simple threshold - items below this frequency get pruned
-        let threshold = 2u8;
+        // Calculate target retention ratio based on merge parameters
+        // If we're merging N segments into ~N/target_ratio segments, we want to retain
+        // approximately target_ratio/merge_ratio of the data from each segment.
+        // For shorter chains, be less aggressive (retain more).
+        let effective_target_ratio = if chain_length < merge_ratio {
+            // Short chain - retain more to avoid over-pruning
+            1.0 / chain_length as f64
+        } else {
+            // Normal operation - use configured ratio
+            // merge_ratio=4, target_ratio=2 means 4 segments -> ~2 segments
+            // So we want to retain about 50% of total data
+            target_ratio as f64 / merge_ratio as f64
+        };
+
+        // Start with cutoff = 1.0 (most permissive - only prune items with freq < 1)
+        // The cutoff will adapt based on actual retention vs target
+        let mut cutoff = 1.0f64;
 
         // Phase 1: Prune the destination segment and compact it
         // This creates free space at the end for items from source segments
         let dest_segment = cache.segments().get(dest_seg_id)?;
-        dest_segment.prune(cache.hashtable(), threshold, metrics);
+        let (new_cutoff, _, _, _) = dest_segment.prune(cache.hashtable(), cutoff, effective_target_ratio, metrics);
+        cutoff = new_cutoff;
         let dest_write_offset = dest_segment.compact(cache.hashtable(), metrics) as usize;
         let dest_capacity = dest_segment.data_len();
         let mut dest_free_space = dest_capacity - dest_write_offset;
@@ -952,8 +1028,9 @@ impl TtlBucket {
                 None => continue,
             };
 
-            // Prune the source segment
-            let (_, items_retained, _, _) = src_segment.prune(cache.hashtable(), threshold, metrics);
+            // Prune the source segment using the adaptive cutoff
+            let (new_cutoff, items_retained, _, _) = src_segment.prune(cache.hashtable(), cutoff, effective_target_ratio, metrics);
+            cutoff = new_cutoff;
 
             if items_retained == 0 {
                 // Source segment is empty after pruning - remove from chain and release
@@ -1004,10 +1081,10 @@ impl TtlBucket {
                 }
                 None => {
                     // Destination is full - stop merging
-                    // The items in source segments that weren't copied are still valid
-                    // (they're marked as deleted in the source but hashtable still points to them)
-                    // This is a problem - we need to undo the prune for remaining sources
-                    // For now, just break and let the remaining sources stay as-is
+                    // Items that survived pruning but couldn't be copied remain in the source
+                    // segment which stays in the chain. This is safe because:
+                    // 1. Pruned items were already unlinked from hashtable
+                    // 2. Surviving items still have valid hashtable entries pointing to source
                     break;
                 }
             }
@@ -1117,15 +1194,20 @@ impl TtlBucket {
         let next_id = segment.next();
         let prev_id = segment.prev();
 
-        // Step 2-4: Update previous segment's next pointer using Relinking protocol
-        if let Some(prev_id) = prev_id {
-            let prev_segment = cache
+        // CRITICAL: Lock both neighbors BEFORE making any changes to ensure atomicity.
+        // If we update prev->next before locking next, and then fail to lock next,
+        // the chain is left corrupted (prev->next points to next, but next->prev
+        // still points to the removed segment).
+
+        // Step 2: Lock prev segment if it exists
+        let prev_segment = if let Some(prev_id) = prev_id {
+            let prev_seg = cache
                 .segments()
                 .get(prev_id)
                 .ok_or(RemoveSegmentError::InvalidPrevSegmentId)?;
 
             // Verify chain integrity
-            let prev_next = prev_segment.next();
+            let prev_next = prev_seg.next();
             if prev_next != Some(segment_id) {
                 panic!(
                     "Chain corruption detected: segment {} prev pointer points to {}, but segment {} next pointer is {:?}",
@@ -1135,7 +1217,7 @@ impl TtlBucket {
 
             // Lock prev segment: Sealed → Relinking
             // (prev cannot be Live since segment_id exists after it)
-            if !prev_segment.cas_metadata(
+            if !prev_seg.cas_metadata(
                 SegmentState::Sealed,
                 SegmentState::Relinking,
                 None,
@@ -1145,8 +1227,82 @@ impl TtlBucket {
                 return Err(RemoveSegmentError::FailedToLockPrevSegment);
             }
 
-            // Update prev's next pointer to skip over removed segment
-            prev_segment.cas_metadata(
+            Some(prev_seg)
+        } else {
+            None
+        };
+
+        // Step 3: Lock next segment if it exists (before making any changes to prev)
+        let (next_segment, original_next_state) = if let Some(next_id) = next_id {
+            let next_seg = match cache.segments().get(next_id) {
+                Some(seg) => seg,
+                None => {
+                    // Unlock prev before returning error
+                    if let Some(prev_seg) = prev_segment {
+                        prev_seg.cas_metadata(
+                            SegmentState::Relinking,
+                            SegmentState::Sealed,
+                            None,
+                            None,
+                            metrics,
+                        );
+                    }
+                    return Err(RemoveSegmentError::InvalidNextSegmentId);
+                }
+            };
+
+            // Verify chain integrity
+            let next_prev = next_seg.prev();
+            if next_prev != Some(segment_id) {
+                // Unlock prev before panicking
+                if let Some(prev_seg) = prev_segment {
+                    prev_seg.cas_metadata(
+                        SegmentState::Relinking,
+                        SegmentState::Sealed,
+                        None,
+                        None,
+                        metrics,
+                    );
+                }
+                panic!(
+                    "Chain corruption detected: segment {} next pointer points to {}, but segment {} prev pointer is {:?}",
+                    segment_id, next_id, next_id, next_prev
+                );
+            }
+
+            // Remember original state (could be Live or Sealed)
+            let original_state = next_seg.state();
+
+            // Lock next segment: (Sealed | Live) → Relinking
+            if !next_seg.cas_metadata(
+                original_state,
+                SegmentState::Relinking,
+                None,
+                None,
+                metrics,
+            ) {
+                // Failed to lock next - unlock prev first (no changes made yet)
+                if let Some(prev_seg) = prev_segment {
+                    prev_seg.cas_metadata(
+                        SegmentState::Relinking,
+                        SegmentState::Sealed,
+                        None,
+                        None,
+                        metrics,
+                    );
+                }
+                return Err(RemoveSegmentError::FailedToLockNextSegment);
+            }
+
+            (Some(next_seg), Some(original_state))
+        } else {
+            (None, None)
+        };
+
+        // Step 4: Now that both neighbors are locked, make the changes atomically
+        // Update prev's next pointer to skip over removed segment
+        if let Some(prev_seg) = prev_segment {
+            prev_seg.cas_metadata(
                 SegmentState::Relinking,
                 SegmentState::Relinking,
                 Some(next_id.unwrap_or(INVALID_SEGMENT_ID)),
@@ -1155,7 +1311,7 @@ impl TtlBucket {
             );
 
             // Unlock prev segment: Relinking → Sealed
-            prev_segment.cas_metadata(
+            prev_seg.cas_metadata(
                 SegmentState::Relinking,
                 SegmentState::Sealed,
                 None,
@@ -1164,38 +1320,9 @@ impl TtlBucket {
             );
         }
 
-        // Step 5-7: Update next segment's prev pointer using Relinking protocol
-        if let Some(next_id) = next_id {
-            let next_segment = cache
-                .segments()
-                .get(next_id)
-                .ok_or(RemoveSegmentError::InvalidNextSegmentId)?;
-
-            // Verify chain integrity
-            let next_prev = next_segment.prev();
-            if next_prev != Some(segment_id) {
-                panic!(
-                    "Chain corruption detected: segment {} next pointer points to {}, but segment {} prev pointer is {:?}",
-                    segment_id, next_id, next_id, next_prev
-                );
-            }
-
-            // Remember original state (could be Live or Sealed)
-            let original_state = next_segment.state();
-
-            // Lock next segment: (Sealed | Live) → Relinking
-            if !next_segment.cas_metadata(
-                original_state,
-                SegmentState::Relinking,
-                None,
-                None,
-                metrics,
-            ) {
-                return Err(RemoveSegmentError::FailedToLockNextSegment);
-            }
-
-            // Update next's prev pointer to skip over removed segment
-            next_segment.cas_metadata(
+        // Step 5: Update next's prev pointer to skip over removed segment
+        if let (Some(next_seg), Some(original_state)) = (next_segment, original_next_state) {
+            next_seg.cas_metadata(
                 SegmentState::Relinking,
                 SegmentState::Relinking,
                 None,
@@ -1204,7 +1331,7 @@ impl TtlBucket {
             );
 
             // Unlock next segment: Relinking → (original state)
-            next_segment.cas_metadata(
+            next_seg.cas_metadata(
                 SegmentState::Relinking,
                 original_state,
                 None,
@@ -1358,7 +1485,7 @@ impl TtlBucket {
         }
 
         // Try to append the item
-        match segment.append_item(key, value, optional, metrics) {
+        match segment.append_item(key, value, optional, metrics, false) {
             Some(offset) => Ok((tail, offset)),
             None => Err(AppendItemError::TailSegmentFull),
         }
@@ -1427,7 +1554,7 @@ impl TtlBucket {
                         Ok(_) => {
                             // New segment added to bucket, now append the item
                             let segment = cache.segments().get(new_segment_id).expect("Invalid segment ID");
-                            if let Some(offset) = segment.append_item(key, value, optional, metrics) {
+                            if let Some(offset) = segment.append_item(key, value, optional, metrics, false) {
                                 return Some((new_segment_id, offset));
                             }
                             // This shouldn't happen with a fresh segment, but handle gracefully
@@ -1456,7 +1583,7 @@ impl TtlBucket {
                             if tail != Self::INVALID_ID {
                                 let segment = cache.segments().get(tail).expect("Invalid tail segment ID");
                                 if segment.state() == SegmentState::Live {
-                                    if let Some(offset) = segment.append_item(key, value, optional, metrics) {
+                                    if let Some(offset) = segment.append_item(key, value, optional, metrics, false) {
                                         return Some((tail, offset));
                                     }
                                 }
@@ -1472,7 +1599,7 @@ impl TtlBucket {
                         Ok(_) => {
                             // Successfully appended the segment, now append the item
                             let segment = cache.segments().get(segment_id).expect("Invalid segment ID");
-                            if let Some(offset) = segment.append_item(key, value, optional, metrics) {
+                            if let Some(offset) = segment.append_item(key, value, optional, metrics, false) {
                                 return Some((segment_id, offset));
                             }
                             // This shouldn't happen with a freshly cleared segment
@@ -1509,12 +1636,12 @@ mod tests {
         assert_eq!(segment.live_items(), 0);
 
         // Append an item
-        let offset = segment.append_item(b"key1", b"value1", b"", cache.metrics());
+        let offset = segment.append_item(b"key1", b"value1", b"", cache.metrics(), false);
         assert!(offset.is_some(), "Should successfully append item");
         assert_eq!(segment.live_items(), 1);
 
         // Append another item
-        let offset2 = segment.append_item(b"key2", b"value2", b"", cache.metrics());
+        let offset2 = segment.append_item(b"key2", b"value2", b"", cache.metrics(), false);
         assert!(offset2.is_some(), "Should successfully append second item");
         assert_eq!(segment.live_items(), 2);
 
@@ -1530,8 +1657,8 @@ mod tests {
         let seg_id = cache.segments().reserve(cache.metrics()).unwrap();
         let segment = cache.segments().get(seg_id).unwrap();
 
-        segment.append_item(b"key1", b"value1", b"", cache.metrics()).unwrap();
-        segment.append_item(b"key2", b"value2", b"", cache.metrics()).unwrap();
+        segment.append_item(b"key1", b"value1", b"", cache.metrics(), false).unwrap();
+        segment.append_item(b"key2", b"value2", b"", cache.metrics(), false).unwrap();
         assert_eq!(segment.live_items(), 2);
 
         // Transition to Locked state (required for clear)

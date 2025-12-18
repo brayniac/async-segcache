@@ -341,7 +341,7 @@ impl Segments {
         let segment = &self.segments[id_usize];
 
         // Segment::mark_deleted() handles all state validation
-        let result = segment.mark_deleted(offset, key, cache.metrics())?;
+        let result = segment.mark_deleted(offset, key, cache.metrics(), false)?;
 
         // If deletion succeeded, check if segment is now empty and sealed
         if result {
@@ -1026,7 +1026,12 @@ impl<'a> Segment<'a> {
     /// - `concurrent_item_append_to_segment` - Two threads appending to same segment
     /// - `segment_full_tracking` - Segment capacity limits and ITEM_APPEND_FULL metric
     /// - `cas_retry_tracking` (ignored) - Three threads for CAS retry validation
-    pub fn append_item(&self, key: &[u8], value: &[u8], optional: &[u8], metrics: &crate::metrics::CacheMetrics) -> Option<u32> {
+    ///
+    /// # Parameters
+    /// - `for_merge`: If true, allows appending to Sealed segments (for merge operations)
+    ///   and skips global metrics updates since we're moving items, not creating new ones.
+    ///   If false, requires Live state and updates global metrics normally.
+    pub fn append_item(&self, key: &[u8], value: &[u8], optional: &[u8], metrics: &crate::metrics::CacheMetrics, for_merge: bool) -> Option<u32> {
         // Validate segment data structures are not corrupted
         assert!(self.data_len > 0,
             "CORRUPTION: segment {} has data_len=0", self.id);
@@ -1052,6 +1057,34 @@ impl<'a> Segment<'a> {
             );
         }
 
+        // Step 1: First state check (fast path rejection)
+        // Always reject Draining and Locked states - these segments are being cleared
+        // and clear() may be concurrently reading the segment data.
+        // Allow all other states:
+        // - Live: normal operation (tail of TTL bucket)
+        // - Sealed: merge operation (head of TTL bucket)
+        // - Reserved: testing/direct segment use
+        // - Linking/Relinking: transitional states (rare but safe)
+        let state = self.state();
+        if state == SegmentState::Draining || state == SegmentState::Locked {
+            return None;
+        }
+
+        // Step 2: Increment ref_count to prevent eviction from proceeding
+        // This ensures that if the segment transitions to Draining, eviction
+        // will wait for us to finish before clearing the segment
+        self.ref_count.fetch_add(1, Ordering::Acquire);
+
+        // Step 3: Second state check (correctness)
+        // The state could have transitioned between step 1 and step 2.
+        // If it did, eviction might already be waiting for ref_count=0.
+        // We must abort to avoid writing to a segment being evicted.
+        let state = self.state();
+        if state == SegmentState::Draining || state == SegmentState::Locked {
+            self.ref_count.fetch_sub(1, Ordering::Release);
+            return None;
+        }
+
         let header = ItemHeader::new(
             key.len() as u8,
             optional.len() as u8,
@@ -1061,12 +1094,13 @@ impl<'a> Segment<'a> {
         );
 
         if header.padded_size() as u32 > self.data_len {
+            self.ref_count.fetch_sub(1, Ordering::Release);
             panic!("item size is out of range. increase segment size");
         }
 
         let item_size = header.padded_size() as u32;
 
-        // Use the standard CAS retry pattern for reserving space
+        // Step 4: Use the standard CAS retry pattern for reserving space
         let reserved_offset = match retry_cas_u32(
             &self.write_offset,
             |current_offset| {
@@ -1088,6 +1122,8 @@ impl<'a> Segment<'a> {
             CasResult::Success(offset) => offset,
             CasResult::Failed(_) | CasResult::Aborted => {
                 // Segment is full, return None
+                // Step 5a: Decrement ref_count before returning
+                self.ref_count.fetch_sub(1, Ordering::Release);
                 metrics.item_append_full.increment();
                 return None;
             }
@@ -1196,92 +1232,21 @@ impl<'a> Segment<'a> {
             self.live_bytes.fetch_add(item_size, Ordering::Relaxed);
 
             metrics.item_append.increment();
-            // Update cache-wide item tracking
-            metrics.items_live.increment();
-            metrics.bytes_live.add(item_size as i64);
+            // Update cache-wide item tracking only for non-merge appends
+            // (merge moves items, doesn't create new ones)
+            if !for_merge {
+                metrics.items_live.increment();
+                metrics.bytes_live.add(item_size as i64);
+            }
+
+            // Step 6: Decrement ref_count now that write is complete
+            // Eviction can now proceed if it was waiting for us
+            self.ref_count.fetch_sub(1, Ordering::Release);
+
             return Some(reserved_offset);
         }
     }
 
-    /// Append an item to this segment without updating global metrics.
-    /// Used during merge/copy operations where the item already exists elsewhere.
-    /// Only updates segment-local statistics, not cache-wide metrics.
-    pub(crate) fn append_item_no_global_metrics(&self, key: &[u8], value: &[u8], optional: &[u8], metrics: &crate::metrics::CacheMetrics) -> Option<u32> {
-        if key.is_empty() || key.len() > ItemHeader::MAX_KEY_LEN {
-            return None;
-        }
-        if optional.len() > ItemHeader::MAX_OPTIONAL_LEN {
-            return None;
-        }
-        if value.len() > ItemHeader::MAX_VALUE_LEN {
-            return None;
-        }
-
-        let header = ItemHeader::new(
-            key.len() as u8,
-            optional.len() as u8,
-            value.len() as u32,
-            false,
-            false,
-        );
-
-        let item_size = header.padded_size() as u32;
-        if item_size > self.data_len {
-            return None;
-        }
-
-        // Reserve space
-        let reserved_offset = match retry_cas_u32(
-            &self.write_offset,
-            |current_offset| {
-                let new_offset = current_offset.saturating_add(item_size);
-                if new_offset > self.data_len {
-                    return None;
-                }
-                Some((new_offset, current_offset))
-            },
-            CasRetryConfig {
-                max_attempts: 16,
-                early_spin_threshold: 4,
-            },
-            metrics,
-        ) {
-            CasResult::Success(offset) => offset,
-            CasResult::Failed(_) | CasResult::Aborted => return None,
-        };
-
-        // Write the data
-        {
-            let mut data_ptr = unsafe { self.data.as_ptr().add(reserved_offset as usize) };
-
-            // Write header
-            {
-                let data = unsafe { std::slice::from_raw_parts_mut(data_ptr, ItemHeader::SIZE) };
-                header.to_bytes(data);
-            }
-
-            unsafe {
-                data_ptr = data_ptr.add(ItemHeader::SIZE);
-                if !optional.is_empty() {
-                    std::ptr::copy_nonoverlapping(optional.as_ptr(), data_ptr, optional.len());
-                    data_ptr = data_ptr.add(optional.len());
-                }
-                std::ptr::copy_nonoverlapping(key.as_ptr(), data_ptr, key.len());
-                data_ptr = data_ptr.add(key.len());
-                if !value.is_empty() {
-                    std::ptr::copy_nonoverlapping(value.as_ptr(), data_ptr, value.len());
-                }
-            }
-
-            fence(Ordering::Release);
-
-            // Only update segment-local statistics, NOT global metrics
-            self.live_items.fetch_add(1, Ordering::Relaxed);
-            self.live_bytes.fetch_add(item_size, Ordering::Relaxed);
-
-            return Some(reserved_offset);
-        }
-    }
 
     pub fn get_item(
         &self,
@@ -1383,7 +1348,12 @@ impl<'a> Segment<'a> {
         Ok(Item::new(header, &mut buffer[..item_len]))
     }
 
-    pub fn mark_deleted(&self, offset: u32, key: &[u8], metrics: &crate::metrics::CacheMetrics) -> Result<bool, ()> {
+    /// Mark an item as deleted in this segment.
+    ///
+    /// # Parameters
+    /// - `for_merge`: If true, skips global metrics update (used during merge where
+    ///   the append also skipped metrics, so no net change is needed)
+    pub fn mark_deleted(&self, offset: u32, key: &[u8], metrics: &crate::metrics::CacheMetrics, for_merge: bool) -> Result<bool, ()> {
         // Check segment state first
         let current_state = self.state();
         match current_state {
@@ -1494,25 +1464,39 @@ impl<'a> Segment<'a> {
         self.live_items.fetch_sub(1, Ordering::Relaxed);
         self.live_bytes.fetch_sub(item_size, Ordering::Relaxed);
 
-        // Update cache-wide item tracking
-        metrics.items_live.decrement();
-        metrics.bytes_live.sub(item_size as i64);
+        // Update cache-wide item tracking only if not merge operation
+        // (merge skips increment on append, so we skip decrement on delete for net zero)
+        if !for_merge {
+            metrics.items_live.decrement();
+            metrics.bytes_live.sub(item_size as i64);
+        }
 
         Ok(true)
     }
 
     /// Prune low-frequency items from this segment during merge eviction.
     ///
-    /// Walks through all items in the segment and marks items with frequency below
-    /// the threshold as deleted. Items at or above the threshold are retained.
+    /// Uses an adaptive cutoff algorithm that adjusts based on actual retention
+    /// vs target retention ratio. Items with frequency below the cutoff are pruned.
     ///
     /// # Parameters
     /// - `hashtable`: Reference to the hashtable for looking up item frequencies
-    /// - `threshold`: Minimum frequency required to survive (items below are pruned)
+    /// - `cutoff`: Current frequency cutoff (items with freq < cutoff are pruned)
+    /// - `target_ratio`: Target fraction of bytes to retain (e.g., 0.25 = keep 25%)
     /// - `metrics`: Cache metrics for tracking pruned/retained counts
     ///
     /// # Returns
-    /// Tuple of (items_retained, items_pruned, bytes_retained, bytes_pruned)
+    /// Tuple of (new_cutoff, items_retained, bytes_retained, bytes_pruned)
+    /// - new_cutoff: Adjusted cutoff for use with subsequent segments
+    /// - items_retained: Number of items that survived pruning
+    /// - bytes_retained: Bytes of data retained
+    /// - bytes_pruned: Bytes of data pruned
+    ///
+    /// # Adaptive Algorithm
+    /// After pruning, the cutoff is adjusted based on actual vs target retention:
+    /// - If we retained too much (actual > target), increase cutoff to be more aggressive
+    /// - If we pruned too much (actual < target * 0.5), decrease cutoff to be gentler
+    /// This allows the algorithm to adapt to the frequency distribution of the workload.
     ///
     /// # Note
     /// This method expects the segment to be in a state where items can be marked
@@ -1521,13 +1505,15 @@ impl<'a> Segment<'a> {
     pub fn prune(
         &self,
         hashtable: &crate::hashtable::Hashtable,
-        threshold: u8,
+        cutoff: f64,
+        target_ratio: f64,
         metrics: &crate::metrics::CacheMetrics,
-    ) -> (u32, u32, u32, u32) {
+    ) -> (f64, u32, u32, u32) {
         let mut items_retained = 0u32;
-        let mut items_pruned = 0u32;
+        let mut _items_pruned = 0u32;
         let mut bytes_retained = 0u32;
         let mut bytes_pruned = 0u32;
+        let mut total_live_bytes = 0u32;
 
         let mut current_offset = 0u32;
         let write_offset = self.write_offset.load(Ordering::Acquire);
@@ -1555,11 +1541,14 @@ impl<'a> Segment<'a> {
 
             // Skip already deleted items
             if header.is_deleted() {
-                items_pruned += 1;
+                _items_pruned += 1;
                 bytes_pruned += item_size;
                 current_offset += item_size;
                 continue;
             }
+
+            // Track total live bytes for ratio calculation
+            total_live_bytes += item_size;
 
             // Extract the key to look up frequency in hashtable
             let raw_item = unsafe { std::slice::from_raw_parts(data_ptr, header.padded_size()) };
@@ -1570,15 +1559,16 @@ impl<'a> Segment<'a> {
             // Look up the item's frequency from the hashtable
             let freq = self.get_item_frequency(hashtable, key, self.id, current_offset);
 
-            if freq >= threshold {
-                // Item survives - frequency is at or above threshold
+            if (freq as f64) >= cutoff {
+                // Item survives - frequency is at or above cutoff
                 items_retained += 1;
                 bytes_retained += item_size;
             } else {
                 // Item is pruned - mark it as deleted and unlink from hashtable
-                let _ = self.mark_deleted(current_offset, key, metrics);
+                // Use for_merge=false because pruned items are truly deleted (not moved)
+                let _ = self.mark_deleted(current_offset, key, metrics, false);
                 hashtable.unlink_item(key, self.id, current_offset, metrics);
-                items_pruned += 1;
+                _items_pruned += 1;
                 bytes_pruned += item_size;
                 metrics.merge_evict_items_pruned.increment();
             }
@@ -1591,7 +1581,30 @@ impl<'a> Segment<'a> {
             metrics.merge_evict_items_retained.increment();
         }
 
-        (items_retained, items_pruned, bytes_retained, bytes_pruned)
+        // Calculate actual retention ratio and adjust cutoff for next segment
+        let actual_ratio = if total_live_bytes > 0 {
+            bytes_retained as f64 / total_live_bytes as f64
+        } else {
+            0.0
+        };
+
+        // Adaptive cutoff adjustment:
+        // - If we retained too much compared to target, increase cutoff (more aggressive)
+        // - If we pruned too much compared to target, decrease cutoff (more gentle)
+        let new_cutoff = if actual_ratio > target_ratio {
+            // Retained more than target - be more aggressive next time
+            // Increase cutoff, but cap at 127 (max frequency)
+            (cutoff + 1.0).min(127.0)
+        } else if actual_ratio < target_ratio * 0.5 {
+            // Pruned too aggressively - be gentler next time
+            // Decrease cutoff, but floor at 1.0 (minimum meaningful frequency)
+            (cutoff - 0.5).max(1.0)
+        } else {
+            // Within acceptable range, keep cutoff stable
+            cutoff
+        };
+
+        (new_cutoff, items_retained, bytes_retained, bytes_pruned)
     }
 
     /// Get the frequency of an item from the hashtable.
@@ -1803,8 +1816,8 @@ impl<'a> Segment<'a> {
             let key = &raw_item[key_start..key_end];
             let value = &raw_item[value_start..value_end];
 
-            // Append to destination segment - this increments global metrics
-            match dest.append_item(key, value, optional, metrics) {
+            // Append to destination segment for merge (allows Sealed state, no global metrics)
+            match dest.append_item(key, value, optional, metrics, true) {
                 Some(new_offset) => {
                     // Check if offset exceeds hashtable limit (stored as offset/8 in 20 bits)
                     // Max offset is 0xFFFFF * 8 = 8,388,600 bytes
@@ -1816,11 +1829,9 @@ impl<'a> Segment<'a> {
                     // Use link_item which handles replacement of existing entries
                     let _ = hashtable.link_item(key, dest_seg_id, new_offset, segments, metrics);
 
-                    // Mark the source item as deleted. This properly decrements the global metrics
-                    // (items_live, bytes_live) since the source item is being consumed.
-                    // The net effect is: append_item (+1) + mark_deleted (-1) = 0 change,
-                    // which is correct since we're moving, not duplicating.
-                    let _ = self.mark_deleted(current_offset, key, metrics);
+                    // Mark the source item as deleted without decrementing global metrics
+                    // since we're moving items (append_item with for_merge=true didn't increment).
+                    let _ = self.mark_deleted(current_offset, key, metrics, true);
 
                     items_copied += 1;
                 }
@@ -1849,7 +1860,7 @@ mod tests {
         let segment = cache.segments().get(seg_id).unwrap();
 
         // Append an item
-        let offset = segment.append_item(b"testkey", b"testvalue", b"", cache.metrics()).unwrap();
+        let offset = segment.append_item(b"testkey", b"testvalue", b"", cache.metrics(), false).unwrap();
 
         // Get the item back
         let mut buffer = vec![0u8; 1024];
@@ -1868,7 +1879,7 @@ mod tests {
         let seg_id = cache.segments().reserve(cache.metrics()).unwrap();
         let segment = cache.segments().get(seg_id).unwrap();
 
-        let offset = segment.append_item(b"key1", b"value1", b"", cache.metrics()).unwrap();
+        let offset = segment.append_item(b"key1", b"value1", b"", cache.metrics(), false).unwrap();
 
         let mut buffer = vec![0u8; 1024];
         let result = segment.get_item(offset, b"key2", &mut buffer);
@@ -1895,7 +1906,7 @@ mod tests {
         let seg_id = cache.segments().reserve(cache.metrics()).unwrap();
         let segment = cache.segments().get(seg_id).unwrap();
 
-        let offset = segment.append_item(b"key", b"value", b"", cache.metrics()).unwrap();
+        let offset = segment.append_item(b"key", b"value", b"", cache.metrics(), false).unwrap();
 
         // Provide a buffer that's too small
         let mut buffer = vec![0u8; 5];
@@ -1910,7 +1921,7 @@ mod tests {
         let seg_id = cache.segments().reserve(cache.metrics()).unwrap();
         let segment = cache.segments().get(seg_id).unwrap();
 
-        let offset = segment.append_item(b"key", b"value", b"", cache.metrics()).unwrap();
+        let offset = segment.append_item(b"key", b"value", b"", cache.metrics(), false).unwrap();
 
         // Transition to Draining state
         segment.cas_metadata(
@@ -1933,7 +1944,7 @@ mod tests {
         let seg_id = cache.segments().reserve(cache.metrics()).unwrap();
         let segment = cache.segments().get(seg_id).unwrap();
 
-        let offset = segment.append_item(b"key", b"value", b"", cache.metrics()).unwrap();
+        let offset = segment.append_item(b"key", b"value", b"", cache.metrics(), false).unwrap();
 
         // Transition to Locked state
         segment.cas_metadata(
@@ -1957,7 +1968,7 @@ mod tests {
         let seg_id = cache.segments().reserve(cache.metrics()).unwrap();
         let segment = cache.segments().get(seg_id).unwrap();
 
-        let offset = segment.append_item(b"key", b"value", b"", cache.metrics()).unwrap();
+        let offset = segment.append_item(b"key", b"value", b"", cache.metrics(), false).unwrap();
 
         // Transition to Relinking state
         segment.cas_metadata(
@@ -1982,9 +1993,9 @@ mod tests {
         let segment = cache.segments().get(seg_id).unwrap();
 
         // Append multiple items
-        let offset1 = segment.append_item(b"key1", b"value1", b"opt1", cache.metrics()).unwrap();
-        let offset2 = segment.append_item(b"key2", b"value2", b"", cache.metrics()).unwrap();
-        let offset3 = segment.append_item(b"key3", b"value3", b"opt3", cache.metrics()).unwrap();
+        let offset1 = segment.append_item(b"key1", b"value1", b"opt1", cache.metrics(), false).unwrap();
+        let offset2 = segment.append_item(b"key2", b"value2", b"", cache.metrics(), false).unwrap();
+        let offset3 = segment.append_item(b"key3", b"value3", b"opt3", cache.metrics(), false).unwrap();
 
         // Read them back
         let mut buffer = vec![0u8; 1024];
@@ -2011,11 +2022,11 @@ mod tests {
         let segment = cache.segments().get(seg_id).unwrap();
 
         // Append an item
-        let offset = segment.append_item(b"key", b"value", b"", cache.metrics()).unwrap();
+        let offset = segment.append_item(b"key", b"value", b"", cache.metrics(), false).unwrap();
         assert_eq!(segment.live_items(), 1);
 
         // Mark it deleted
-        let result = segment.mark_deleted(offset, b"key", cache.metrics());
+        let result = segment.mark_deleted(offset, b"key", cache.metrics(), false);
         assert_eq!(result, Ok(true), "Should successfully mark deleted");
 
         // Check statistics updated
@@ -2033,13 +2044,13 @@ mod tests {
         let seg_id = cache.segments().reserve(cache.metrics()).unwrap();
         let segment = cache.segments().get(seg_id).unwrap();
 
-        let offset = segment.append_item(b"key", b"value", b"", cache.metrics()).unwrap();
+        let offset = segment.append_item(b"key", b"value", b"", cache.metrics(), false).unwrap();
 
         // First delete succeeds
-        assert_eq!(segment.mark_deleted(offset, b"key", cache.metrics()), Ok(true));
+        assert_eq!(segment.mark_deleted(offset, b"key", cache.metrics(), false), Ok(true));
 
         // Second delete returns false (already deleted)
-        assert_eq!(segment.mark_deleted(offset, b"key", cache.metrics()), Ok(false));
+        assert_eq!(segment.mark_deleted(offset, b"key", cache.metrics(), false), Ok(false));
 
         // live_items should only be decremented once
         assert_eq!(segment.live_items(), 0);
@@ -2051,10 +2062,10 @@ mod tests {
         let seg_id = cache.segments().reserve(cache.metrics()).unwrap();
         let segment = cache.segments().get(seg_id).unwrap();
 
-        let offset = segment.append_item(b"key1", b"value1", b"", cache.metrics()).unwrap();
+        let offset = segment.append_item(b"key1", b"value1", b"", cache.metrics(), false).unwrap();
 
         // Try to delete with wrong key
-        let result = segment.mark_deleted(offset, b"key2", cache.metrics());
+        let result = segment.mark_deleted(offset, b"key2", cache.metrics(), false);
         assert_eq!(result, Err(()), "Should return error for key mismatch");
 
         // Item should still be live
@@ -2074,7 +2085,7 @@ mod tests {
         let segment = cache.segments().get(seg_id).unwrap();
 
         // Try to mark deleted at invalid offset
-        segment.mark_deleted(segment.data_len + 100, b"key", cache.metrics()).unwrap();
+        segment.mark_deleted(segment.data_len + 100, b"key", cache.metrics(), false).unwrap();
     }
 
     #[test]
@@ -2083,7 +2094,7 @@ mod tests {
         let seg_id = cache.segments().reserve(cache.metrics()).unwrap();
         let segment = cache.segments().get(seg_id).unwrap();
 
-        let offset = segment.append_item(b"key", b"value", b"", cache.metrics()).unwrap();
+        let offset = segment.append_item(b"key", b"value", b"", cache.metrics(), false).unwrap();
 
         // Transition to Draining
         segment.cas_metadata(
@@ -2095,7 +2106,7 @@ mod tests {
         );
 
         // mark_deleted should return Ok(false) - treat as already deleted
-        assert_eq!(segment.mark_deleted(offset, b"key", cache.metrics()), Ok(false));
+        assert_eq!(segment.mark_deleted(offset, b"key", cache.metrics(), false), Ok(false));
     }
 
     #[test]
@@ -2104,7 +2115,7 @@ mod tests {
         let seg_id = cache.segments().reserve(cache.metrics()).unwrap();
         let segment = cache.segments().get(seg_id).unwrap();
 
-        let offset = segment.append_item(b"key", b"value", b"", cache.metrics()).unwrap();
+        let offset = segment.append_item(b"key", b"value", b"", cache.metrics(), false).unwrap();
 
         // Transition to Locked
         segment.cas_metadata(
@@ -2116,7 +2127,7 @@ mod tests {
         );
 
         // mark_deleted should return Ok(false)
-        assert_eq!(segment.mark_deleted(offset, b"key", cache.metrics()), Ok(false));
+        assert_eq!(segment.mark_deleted(offset, b"key", cache.metrics(), false), Ok(false));
     }
 
     #[test]
@@ -2126,7 +2137,7 @@ mod tests {
         let seg_id = cache.segments().reserve(cache.metrics()).unwrap();
         let segment = cache.segments().get(seg_id).unwrap();
 
-        let offset = segment.append_item(b"key", b"value", b"", cache.metrics()).unwrap();
+        let offset = segment.append_item(b"key", b"value", b"", cache.metrics(), false).unwrap();
 
         // Transition to Relinking
         segment.cas_metadata(
@@ -2138,7 +2149,7 @@ mod tests {
         );
 
         // mark_deleted should succeed
-        assert_eq!(segment.mark_deleted(offset, b"key", cache.metrics()), Ok(true));
+        assert_eq!(segment.mark_deleted(offset, b"key", cache.metrics(), false), Ok(true));
         assert_eq!(segment.live_items(), 0);
     }
 
@@ -2149,20 +2160,20 @@ mod tests {
         let segment = cache.segments().get(seg_id).unwrap();
 
         // Append multiple items
-        let offset1 = segment.append_item(b"key1", b"value1", b"", cache.metrics()).unwrap();
-        let offset2 = segment.append_item(b"key2", b"value2", b"", cache.metrics()).unwrap();
-        let offset3 = segment.append_item(b"key3", b"value3", b"", cache.metrics()).unwrap();
+        let offset1 = segment.append_item(b"key1", b"value1", b"", cache.metrics(), false).unwrap();
+        let offset2 = segment.append_item(b"key2", b"value2", b"", cache.metrics(), false).unwrap();
+        let offset3 = segment.append_item(b"key3", b"value3", b"", cache.metrics(), false).unwrap();
 
         assert_eq!(segment.live_items(), 3);
 
         // Delete them in any order
-        assert_eq!(segment.mark_deleted(offset2, b"key2", cache.metrics()), Ok(true));
+        assert_eq!(segment.mark_deleted(offset2, b"key2", cache.metrics(), false), Ok(true));
         assert_eq!(segment.live_items(), 2);
 
-        assert_eq!(segment.mark_deleted(offset1, b"key1", cache.metrics()), Ok(true));
+        assert_eq!(segment.mark_deleted(offset1, b"key1", cache.metrics(), false), Ok(true));
         assert_eq!(segment.live_items(), 1);
 
-        assert_eq!(segment.mark_deleted(offset3, b"key3", cache.metrics()), Ok(true));
+        assert_eq!(segment.mark_deleted(offset3, b"key3", cache.metrics(), false), Ok(true));
         assert_eq!(segment.live_items(), 0);
     }
 
@@ -2208,9 +2219,9 @@ mod tests {
         let segment = cache.segments().get(seg_id).unwrap();
 
         // Add some items
-        segment.append_item(b"key1", b"value1", b"", cache.metrics()).unwrap();
-        segment.append_item(b"key2", b"value2", b"", cache.metrics()).unwrap();
-        segment.append_item(b"key3", b"value3", b"", cache.metrics()).unwrap();
+        segment.append_item(b"key1", b"value1", b"", cache.metrics(), false).unwrap();
+        segment.append_item(b"key2", b"value2", b"", cache.metrics(), false).unwrap();
+        segment.append_item(b"key3", b"value3", b"", cache.metrics(), false).unwrap();
 
         assert_eq!(segment.live_items(), 3);
         let write_offset_before = segment.write_offset();
@@ -2254,7 +2265,7 @@ mod tests {
         let segment = cache.segments().get(seg_id).unwrap();
 
         // Add an item
-        segment.append_item(b"key", b"value", b"", cache.metrics()).unwrap();
+        segment.append_item(b"key", b"value", b"", cache.metrics(), false).unwrap();
 
         // Transition to Locked state with cleared links
         prepare_segment_for_clear(segment, cache.metrics());
@@ -2279,7 +2290,7 @@ mod tests {
         assert_eq!(segment.bucket_id(), Some(42));
 
         // Add an item
-        segment.append_item(b"key", b"value", b"", cache.metrics()).unwrap();
+        segment.append_item(b"key", b"value", b"", cache.metrics(), false).unwrap();
 
         // Prepare segment for clearing
         prepare_segment_for_clear(segment, cache.metrics());
@@ -2299,7 +2310,7 @@ mod tests {
         let seg_id = cache.segments().reserve(cache.metrics()).unwrap();
         let segment = cache.segments().get(seg_id).unwrap();
 
-        let offset = segment.append_item(b"key", b"value", b"", cache.metrics()).unwrap();
+        let offset = segment.append_item(b"key", b"value", b"", cache.metrics(), false).unwrap();
         assert_eq!(segment.live_items(), 1);
 
         // Delete through high-level API
@@ -2325,7 +2336,7 @@ mod tests {
             cache.metrics(),
         );
 
-        let offset = segment.append_item(b"key", b"value", b"", cache.metrics()).unwrap();
+        let offset = segment.append_item(b"key", b"value", b"", cache.metrics(), false).unwrap();
 
         // Delete the item - segment becomes empty and sealed
         let result = cache.segments().delete_item(&cache, seg_id, offset, b"key");
@@ -2435,7 +2446,7 @@ mod tests {
         let seg_id = cache.segments().reserve(cache.metrics()).unwrap();
         let segment = cache.segments().get(seg_id).unwrap();
 
-        let offset = segment.append_item(b"key", b"value", b"", cache.metrics()).unwrap();
+        let offset = segment.append_item(b"key", b"value", b"", cache.metrics(), false).unwrap();
 
         // First deletion succeeds
         assert_eq!(cache.segments().delete_item(&cache, seg_id, offset, b"key"), Ok(true));
@@ -2450,7 +2461,7 @@ mod tests {
         let seg_id = cache.segments().reserve(cache.metrics()).unwrap();
         let segment = cache.segments().get(seg_id).unwrap();
 
-        let offset = segment.append_item(b"key1", b"value1", b"", cache.metrics()).unwrap();
+        let offset = segment.append_item(b"key1", b"value1", b"", cache.metrics(), false).unwrap();
 
         // Wrong key returns error
         let result = cache.segments().delete_item(&cache, seg_id, offset, b"key2");

@@ -181,6 +181,10 @@ impl Hashtable {
     ///
     /// This is a helper for get() to check that a tag match is actually the right key
     /// (since tags are only 12 bits and can collide).
+    ///
+    /// # Optimizations
+    /// - Early key length check before full comparison (avoids memcmp on length mismatch)
+    /// - Caller should prefetch segment data before calling for best performance
     fn verify_key(&self, key: &[u8], segment_id: u32, offset: u32, segments: &crate::segments::Segments) -> bool {
         // Get the segment
         let segment = match segments.get(segment_id) {
@@ -228,6 +232,17 @@ impl Hashtable {
                 // Print which thread/context is hitting this
                 eprintln!("verify_key: item at seg={}, off={} is deleted (checking key={:?})",
                     segment_id, offset, key);
+            }
+            return false;
+        }
+
+        // Early key length check - fast rejection before full memcmp
+        // This is a significant optimization when tag collisions occur
+        if header.key_len() as usize != key.len() {
+            #[cfg(feature = "loom")]
+            {
+                eprintln!("verify_key: key length mismatch at seg={}, off={}: stored_len={}, search_len={}",
+                    segment_id, offset, header.key_len(), key.len());
             }
             return false;
         }
@@ -347,7 +362,7 @@ impl Hashtable {
                     // Mark old item deleted if this was an overwrite
                     if let Some((old_segment_id, old_offset)) = old_location {
                         if let Some(old_segment) = cache.segments().get(old_segment_id) {
-                            let _ = old_segment.mark_deleted(old_offset, key, cache.metrics());
+                            let _ = old_segment.mark_deleted(old_offset, key, cache.metrics(), false);
 
                             // Check for eager removal - if old segment is now empty and sealed,
                             // remove it from the TTL bucket chain and return it to the free pool
@@ -403,7 +418,7 @@ impl Hashtable {
                     if !found_slot {
                         // Bucket is full - mark our appended item deleted and fail
                         if let Some(our_segment) = cache.segments().get(segment_id) {
-                            let _ = our_segment.mark_deleted(offset, key, cache.metrics());
+                            let _ = our_segment.mark_deleted(offset, key, cache.metrics(), false);
                         }
                         return Err(());
                     }
@@ -983,7 +998,7 @@ mod tests {
         // Reserve a segment and append an item
         let seg_id = segments.reserve(&metrics).unwrap();
         let segment = segments.get(seg_id).unwrap();
-        let offset = segment.append_item(b"test_key", b"test_value", b"", &metrics).unwrap();
+        let offset = segment.append_item(b"test_key", b"test_value", b"", &metrics, false).unwrap();
 
         // Manually insert into hashtable for testing
         // Hash the key to get bucket and tag
@@ -1022,7 +1037,7 @@ mod tests {
         // Create and append item
         let seg_id = segments.reserve(&metrics).unwrap();
         let segment = segments.get(seg_id).unwrap();
-        let offset = segment.append_item(b"deleted_key", b"value", b"", &metrics).unwrap();
+        let offset = segment.append_item(b"deleted_key", b"value", b"", &metrics, false).unwrap();
 
         // Insert into hashtable
         let mut hasher = hashtable.hash_builder.build_hasher();
@@ -1035,7 +1050,7 @@ mod tests {
         hashtable.data[bucket_index].items[0].store(packed, Ordering::Release);
 
         // Mark item as deleted
-        segment.mark_deleted(offset, b"deleted_key", &metrics).unwrap();
+        segment.mark_deleted(offset, b"deleted_key", &metrics, false).unwrap();
 
         // Get should return None for deleted item
         let result = hashtable.get(b"deleted_key", &segments);
@@ -1051,7 +1066,7 @@ mod tests {
         // Reserve segment and append item
         let seg_id = segments.reserve(&metrics).unwrap();
         let segment = segments.get(seg_id).unwrap();
-        let offset = segment.append_item(b"link_key", b"value", b"", &metrics).unwrap();
+        let offset = segment.append_item(b"link_key", b"value", b"", &metrics, false).unwrap();
 
         // Link the item
         let result = hashtable.link_item(b"link_key", seg_id, offset, &segments, &metrics);
@@ -1137,7 +1152,7 @@ mod tests {
         // Create item with key1
         let seg_id = segments.reserve(&metrics).unwrap();
         let segment = segments.get(seg_id).unwrap();
-        let offset = segment.append_item(b"key1", b"value1", b"", &metrics).unwrap();
+        let offset = segment.append_item(b"key1", b"value1", b"", &metrics, false).unwrap();
 
         // Insert into hashtable with key1's hash
         let mut hasher = hashtable.hash_builder.build_hasher();
@@ -1165,7 +1180,7 @@ mod tests {
         // Create and insert an item
         let seg_id = segments.reserve(&metrics).unwrap();
         let segment = segments.get(seg_id).unwrap();
-        let offset = segment.append_item(b"hot_key", b"value", b"", &metrics).unwrap();
+        let offset = segment.append_item(b"hot_key", b"value", b"", &metrics, false).unwrap();
 
         // Insert into hashtable with initial freq=0
         let mut hasher = hashtable.hash_builder.build_hasher();

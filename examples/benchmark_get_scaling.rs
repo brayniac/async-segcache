@@ -14,7 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const BENCHMARK_DURATION_SECS: u64 = 5;
-const KEY_SPACE: u64 = 100_000; // Number of unique keys to use
+const KEY_SPACE: u64 = 1_000_000; // Number of unique keys to use
 const VALUE_SIZE: usize = 128;
 const TTL_SECS: u32 = 3600;
 
@@ -104,7 +104,7 @@ async fn run_benchmark(num_threads: usize) -> (u64, Duration) {
 /// Run latency benchmark for a specific number of threads
 async fn run_latency_benchmark(num_threads: usize) -> Vec<Duration> {
     let cache = Arc::new(CacheBuilder::new()
-        .hashtable_power(18)
+        .hashtable_power(18) // 256K buckets
         .build());
 
     // Populate cache first

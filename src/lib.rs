@@ -363,7 +363,7 @@ impl Cache {
                 self.core.metrics.item_expire.increment();
 
                 // Mark deleted in segment (ignore errors - item may already be deleted)
-                let _ = segment.mark_deleted(offset, key, &self.core.metrics);
+                let _ = segment.mark_deleted(offset, key, &self.core.metrics, false);
 
                 // Unlink from hashtable
                 self.core.hashtable.unlink_item(key, segment_id, offset, &self.core.metrics);
@@ -393,7 +393,7 @@ impl Cache {
             .get(segment_id)
             .ok_or(DeleteItemError::InvalidSegment)?;
 
-        match segment.mark_deleted(offset, key, &self.core.metrics) {
+        match segment.mark_deleted(offset, key, &self.core.metrics, false) {
             Ok(true) => {
                 // Successfully marked as deleted
             }
@@ -2560,18 +2560,19 @@ mod cache_tests {
         // Add several items
         for i in 0..10 {
             let key = format!("prune_key_{}", i);
-            let _ = segment.append_item(key.as_bytes(), b"value", b"", cache.metrics());
+            let _ = segment.append_item(key.as_bytes(), b"value", b"", cache.metrics(), false);
         }
 
         assert_eq!(segment.live_items(), 10, "Should have 10 items");
 
-        // Prune with high threshold - should prune items with freq < threshold
+        // Prune with cutoff=1.0 and target_ratio=0.5
         // Since items weren't accessed through hashtable, they'll have freq=0
-        let (retained, pruned, _, _) = segment.prune(cache.hashtable(), 1, cache.metrics());
+        // Items with freq < cutoff (1.0) will be pruned
+        let (_new_cutoff, items_retained, _bytes_retained, _bytes_pruned) =
+            segment.prune(cache.hashtable(), 1.0, 0.5, cache.metrics());
 
-        // All items should be pruned (freq=0 < threshold=1)
-        assert_eq!(pruned, 10, "All items should be pruned");
-        assert_eq!(retained, 0, "No items should be retained");
+        // All items should be pruned (freq=0 < cutoff=1.0)
+        assert_eq!(items_retained, 0, "No items should be retained");
     }
 
     #[tokio::test]

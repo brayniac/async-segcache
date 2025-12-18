@@ -15,6 +15,7 @@ use item::*;
 use segments::*;
 use ttlbuckets::*;
 
+pub use item::ItemGuard;
 pub use metrics::CacheMetrics;
 pub use std::time::Duration;
 

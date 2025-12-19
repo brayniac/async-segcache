@@ -1604,7 +1604,7 @@ impl<'a> Segment<'a> {
         let tag = ((hash >> 32) & 0xFFF) as u16;
 
         // Search the bucket for our item
-        let bucket = &hashtable.data[bucket_index];
+        let bucket = hashtable.bucket(bucket_index);
 
         for slot in &bucket.items {
             let packed = slot.load(Ordering::Acquire);

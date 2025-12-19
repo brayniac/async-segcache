@@ -2,17 +2,27 @@ use std::hash::Hasher;
 use std::hash::BuildHasher;
 use std::hash::Hash;
 use crate::util::*;
+use crate::hugepage::{HugepageAllocation, HugepageSize, allocate};
 use ahash::RandomState;
 use crate::sync::*;
 
 pub struct Hashtable {
     pub(crate) hash_builder: Box<RandomState>,
-    pub(crate) data: Vec<Hashbucket>,
+    /// Mmap-backed storage for hash buckets.
+    pub(crate) allocation: HugepageAllocation,
+    /// Number of buckets (2^power).
+    pub(crate) num_buckets: usize,
     pub(crate) mask: u64,
 }
 
 impl Hashtable {
-    pub fn new(power: u8) -> Self {
+    /// Create a new hashtable with default (no hugepage) allocation.
+    pub fn new(power: u8) -> Result<Self, std::io::Error> {
+        Self::with_hugepage_size(power, HugepageSize::None)
+    }
+
+    /// Create a new hashtable with specified hugepage size preference.
+    pub fn with_hugepage_size(power: u8, hugepage_size: HugepageSize) -> Result<Self, std::io::Error> {
         if power < 4 {
             panic!("power too low");
         }
@@ -28,29 +38,35 @@ impl Hashtable {
         #[cfg(not(test))]
         let hash_builder = RandomState::new();
 
-        let buckets = 1_u64 << power;
-        let mask = buckets - 1;
+        let num_buckets = 1_usize << power;
+        let mask = (num_buckets as u64) - 1;
 
-        let mut data = Vec::with_capacity(buckets as usize);
-        for _ in 0..(buckets as usize) {
-            data.push(Hashbucket {
-                info: AtomicU64::new(0),
-                items: [
-                    AtomicU64::new(0),
-                    AtomicU64::new(0),
-                    AtomicU64::new(0),
-                    AtomicU64::new(0),
-                    AtomicU64::new(0),
-                    AtomicU64::new(0),
-                    AtomicU64::new(0),
-                ],
-            });
-        }
+        // Calculate size needed for all buckets
+        // Each Hashbucket is 64 bytes (8 * AtomicU64)
+        let alloc_size = num_buckets * std::mem::size_of::<Hashbucket>();
 
-        Self {
+        // Allocate mmap'd memory with hugepage support
+        let allocation = allocate(alloc_size, hugepage_size)?;
+
+        // Initialize all buckets to zero (already done by mmap, but be explicit)
+        // The prefault in hugepage::allocate already zeroed the memory via write_volatile
+        // AtomicU64::new(0) is equivalent to all-zeros representation
+
+        Ok(Self {
             hash_builder: Box::new(hash_builder),
-            data,
+            allocation,
+            num_buckets,
             mask,
+        })
+    }
+
+    /// Get a reference to a bucket by index.
+    #[inline]
+    pub(crate) fn bucket(&self, index: usize) -> &Hashbucket {
+        debug_assert!(index < self.num_buckets);
+        unsafe {
+            let ptr = self.allocation.as_ptr() as *const Hashbucket;
+            &*ptr.add(index)
         }
     }
 
@@ -87,7 +103,7 @@ impl Hashtable {
         let tag = ((hash >> 32) & 0xFFF) as u16;
 
         // Search for the item in the bucket
-        let bucket = &self.data[bucket_index];
+        let bucket = self.bucket(bucket_index);
 
         for slot in &bucket.items {
             let packed = slot.load(Ordering::Acquire);
@@ -288,7 +304,7 @@ impl Hashtable {
         let hash = hasher.finish();
         let bucket_index = (hash & self.mask) as usize;
         let tag = ((hash >> 32) & 0xFFF) as u16;
-        let bucket = &self.data[bucket_index];
+        let bucket = self.bucket(bucket_index);
 
         // STEP 1: Scan for slot (no lock) - find existing entry or empty slot
         let mut target_slot_info: Option<(usize, u64)> = None; // (slot_idx, current_value)
@@ -460,7 +476,7 @@ impl Hashtable {
         // Pack the new item (initial frequency = 1)
         let new_packed = Hashbucket::pack_item(tag, 1, segment_id, offset);
 
-        let bucket = &self.data[bucket_index];
+        let bucket = self.bucket(bucket_index);
 
         // First pass: check if this key already exists in the bucket
         // If so, atomically replace it to prevent duplicates
@@ -745,7 +761,7 @@ impl Hashtable {
         let tag = ((hash >> 32) & 0xFFF) as u16;
 
         // Search for the item
-        let bucket = &self.data[bucket_index];
+        let bucket = self.bucket(bucket_index);
 
         for slot in &bucket.items {
             let packed = slot.load(Ordering::Acquire);
@@ -822,7 +838,7 @@ impl Hashtable {
         let bucket_index = (hash & self.mask) as usize;
         let tag = ((hash >> 32) & 0xFFF) as u16;
 
-        let bucket = &self.data[bucket_index];
+        let bucket = self.bucket(bucket_index);
 
         // Search for existing entry with matching tag, segment_id, and old_offset
         for slot in &bucket.items {
@@ -991,7 +1007,7 @@ mod tests {
     #[test]
     fn test_get_basic() {
         // Create hashtable and segments
-        let hashtable = Hashtable::new(4); // 16 buckets
+        let hashtable = Hashtable::new(4).unwrap(); // 16 buckets
         let segments = SegmentsBuilder::new().build().unwrap();
         let metrics = CacheMetrics::new();
 
@@ -1011,7 +1027,7 @@ mod tests {
 
         // Pack and store the item in first slot
         let packed = Hashbucket::pack_item(tag, 0, seg_id, offset);
-        hashtable.data[bucket_index].items[0].store(packed, Ordering::Release);
+        hashtable.bucket(bucket_index).items[0].store(packed, Ordering::Release);
 
         // Test get() - should find the item
         let result = hashtable.get(b"test_key", &segments);
@@ -1020,7 +1036,7 @@ mod tests {
 
     #[test]
     fn test_get_not_found() {
-        let hashtable = Hashtable::new(4);
+        let hashtable = Hashtable::new(4).unwrap();
         let segments = SegmentsBuilder::new().build().unwrap();
 
         // Get non-existent key
@@ -1030,7 +1046,7 @@ mod tests {
 
     #[test]
     fn test_get_deleted_item() {
-        let hashtable = Hashtable::new(4);
+        let hashtable = Hashtable::new(4).unwrap();
         let segments = SegmentsBuilder::new().build().unwrap();
         let metrics = CacheMetrics::new();
 
@@ -1047,7 +1063,7 @@ mod tests {
         let bucket_index = (hash & hashtable.mask) as usize;
         let tag = ((hash >> 32) & 0xFFF) as u16;
         let packed = Hashbucket::pack_item(tag, 0, seg_id, offset);
-        hashtable.data[bucket_index].items[0].store(packed, Ordering::Release);
+        hashtable.bucket(bucket_index).items[0].store(packed, Ordering::Release);
 
         // Mark item as deleted
         segment.mark_deleted(offset, b"deleted_key", &metrics, false).unwrap();
@@ -1059,7 +1075,7 @@ mod tests {
 
     #[test]
     fn test_link_item_basic() {
-        let hashtable = Hashtable::new(4);
+        let hashtable = Hashtable::new(4).unwrap();
         let segments = SegmentsBuilder::new().build().unwrap();
         let metrics = CacheMetrics::new();
 
@@ -1079,7 +1095,7 @@ mod tests {
 
     #[test]
     fn test_link_item_bucket_full() {
-        let hashtable = Hashtable::new(4);
+        let hashtable = Hashtable::new(4).unwrap();
         let segments = SegmentsBuilder::new().build().unwrap();
         let metrics = CacheMetrics::new();
 
@@ -1101,7 +1117,7 @@ mod tests {
         // Fill all 7 slots with items (using 8-byte aligned offsets)
         for i in 0..7 {
             let packed = Hashbucket::pack_item(tag, (i + 1) as u8, seg_id, (i * 128) as u32);
-            hashtable.data[bucket_index].items[i as usize].store(packed, Ordering::Release);
+            hashtable.bucket(bucket_index).items[i as usize].store(packed, Ordering::Release);
         }
 
         // Now try to link a new item - should fail because bucket is full
@@ -1110,7 +1126,7 @@ mod tests {
 
         // Verify the new item is NOT in the bucket (all 7 slots should still have original items)
         let mut count = 0;
-        for (i, slot) in hashtable.data[bucket_index].items.iter().enumerate() {
+        for (i, slot) in hashtable.bucket(bucket_index).items.iter().enumerate() {
             let packed = slot.load(Ordering::Acquire);
             assert_ne!(packed, 0, "Slot {} should still be occupied", i);
             assert_ne!(Hashbucket::item_offset(packed), 1024, "New item should not be in slot {}", i);
@@ -1122,7 +1138,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "segment_id")]
     fn test_link_item_segment_id_overflow() {
-        let hashtable = Hashtable::new(4);
+        let hashtable = Hashtable::new(4).unwrap();
         let segments = SegmentsBuilder::new().build().unwrap();
         let metrics = CacheMetrics::new();
 
@@ -1133,7 +1149,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "offset")]
     fn test_link_item_offset_overflow() {
-        let hashtable = Hashtable::new(4);
+        let hashtable = Hashtable::new(4).unwrap();
         let segments = SegmentsBuilder::new().build().unwrap();
         let metrics = CacheMetrics::new();
 
@@ -1145,7 +1161,7 @@ mod tests {
     #[test]
     fn test_get_key_mismatch() {
         // Test that tag collision is handled correctly
-        let hashtable = Hashtable::new(4);
+        let hashtable = Hashtable::new(4).unwrap();
         let segments = SegmentsBuilder::new().build().unwrap();
         let metrics = CacheMetrics::new();
 
@@ -1162,7 +1178,7 @@ mod tests {
         let bucket_index = (hash & hashtable.mask) as usize;
         let tag = ((hash >> 32) & 0xFFF) as u16;
         let packed = Hashbucket::pack_item(tag, 0, seg_id, offset);
-        hashtable.data[bucket_index].items[0].store(packed, Ordering::Release);
+        hashtable.bucket(bucket_index).items[0].store(packed, Ordering::Release);
 
         // Try to get with key2 (wrong key but might have same tag by chance)
         let result = hashtable.get(b"key2", &segments);
@@ -1173,7 +1189,7 @@ mod tests {
     #[test]
     fn test_asfc_frequency_tracking() {
         // Test that ASFC frequency tracking works on get operations
-        let hashtable = Hashtable::new(4);
+        let hashtable = Hashtable::new(4).unwrap();
         let segments = SegmentsBuilder::new().build().unwrap();
         let metrics = CacheMetrics::new();
 
@@ -1190,10 +1206,10 @@ mod tests {
         let bucket_index = (hash & hashtable.mask) as usize;
         let tag = ((hash >> 32) & 0xFFF) as u16;
         let packed = Hashbucket::pack_item(tag, 0, seg_id, offset);
-        hashtable.data[bucket_index].items[0].store(packed, Ordering::Release);
+        hashtable.bucket(bucket_index).items[0].store(packed, Ordering::Release);
 
         // Initial frequency should be 0
-        let initial_packed = hashtable.data[bucket_index].items[0].load(Ordering::Acquire);
+        let initial_packed = hashtable.bucket(bucket_index).items[0].load(Ordering::Acquire);
         let initial_freq = Hashbucket::item_freq(initial_packed);
         assert_eq!(initial_freq, 0);
 
@@ -1205,7 +1221,7 @@ mod tests {
         }
 
         // Check that frequency increased
-        let final_packed = hashtable.data[bucket_index].items[0].load(Ordering::Acquire);
+        let final_packed = hashtable.bucket(bucket_index).items[0].load(Ordering::Acquire);
         let final_freq = Hashbucket::item_freq(final_packed);
 
         // Frequency should have increased (at least to some degree)

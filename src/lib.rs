@@ -251,8 +251,10 @@ impl CacheBuilder {
         let num_segments = self.heap_size / self.segment_size;
         metrics.segments_free.set(num_segments as i64);
 
+        let hashtable = Hashtable::with_hugepage_size(self.hashtable_power, self.hugepage_size)?;
+
         let core = Arc::new(CacheCore {
-            hashtable: Hashtable::new(self.hashtable_power),
+            hashtable,
             segments,
             ttl_buckets: TtlBuckets::new(),
             metrics,

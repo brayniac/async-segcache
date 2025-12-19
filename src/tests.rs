@@ -216,14 +216,19 @@ mod loom_tests {
 
             // Create a small cache with small segments
             let cache = Arc::new(Cache {
-                hashtable: Hashtable::new(4),
-                segments: SegmentsBuilder::new()
-                    .segment_size(128) // Very small segment
-                    .heap_size(128)
-                    .build()
-                    .unwrap(),
-                ttl_buckets: TtlBuckets::new(),
-                metrics: CacheMetrics::new(),
+                core: Arc::new(CacheCore {
+                    hashtable: Hashtable::new(4).unwrap(),
+                    segments: SegmentsBuilder::new()
+                        .segment_size(128) // Very small segment
+                        .heap_size(128)
+                        .build()
+                        .unwrap(),
+                    ttl_buckets: TtlBuckets::new(),
+                    metrics: CacheMetrics::new(),
+                    eviction_policy: EvictionPolicy::None,
+                    merge_ratio: 4,
+                    merge_target_ratio: 8,
+                }),
             });
 
             let seg_id = cache.segments().reserve(cache.metrics()).unwrap();

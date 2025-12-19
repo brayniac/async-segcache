@@ -13,7 +13,7 @@ async fn test_fill_with_value_size(value_size: usize) {
         .heap_size(8 * 1024 * 1024)
         .segment_size(1024 * 1024)
         .hashtable_power(16)
-        .build();
+        .build().unwrap();
 
     let ttl = Duration::from_secs(3600);
     let value = vec![0xAB; value_size];
@@ -131,7 +131,7 @@ async fn test_segment_boundary_items() {
         .heap_size(8 * 1024 * 1024)
         .segment_size(1024 * 1024)
         .hashtable_power(16)
-        .build();
+        .build().unwrap();
 
     let ttl = Duration::from_secs(3600);
 
@@ -188,7 +188,7 @@ async fn test_concurrent_fill() {
         .heap_size(16 * 1024 * 1024)
         .segment_size(1024 * 1024)
         .hashtable_power(16)
-        .build());
+        .build().unwrap());
 
     let ttl = Duration::from_secs(3600);
     let num_threads = 4;
@@ -250,7 +250,7 @@ async fn test_production_scenario() {
         .heap_size(64 * 1024 * 1024)
         .segment_size(1024 * 1024)
         .hashtable_power(16)
-        .build());
+        .build().unwrap());
 
     let ttl = Duration::from_secs(3600);
     let num_threads = 8;
@@ -350,7 +350,7 @@ async fn test_eviction_stress() {
         .heap_size(256 * 1024 * 1024)  // 256MB like production
         .segment_size(1024 * 1024)      // 1MB segments
         .hashtable_power(18)            // 256K buckets like production
-        .build());
+        .build().unwrap());
 
     let ttl = Duration::from_secs(3600);
     let num_threads = 8;
@@ -458,7 +458,7 @@ async fn test_fill_with_exact_segment_size_items() {
         .heap_size(8 * 1024 * 1024)
         .segment_size(1024 * 1024)
         .hashtable_power(16)
-        .build();
+        .build().unwrap();
 
     let ttl = Duration::from_secs(3600);
 

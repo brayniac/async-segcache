@@ -1760,7 +1760,8 @@ mod tests {
             .hashtable_power(4) // Small hashtable (16 buckets)
             .segment_size(256) // Small segments
             .heap_size(1024)   // Room for multiple segments
-            .build();
+            .build()
+            .unwrap();
 
         let bucket = cache.ttl_buckets().get_bucket_for_seconds(60);
 

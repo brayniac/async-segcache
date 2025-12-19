@@ -40,7 +40,7 @@ async fn populate_cache(cache: &Cache, num_keys: u64) {
 async fn run_benchmark(num_threads: usize) -> (u64, Duration) {
     let cache = Arc::new(CacheBuilder::new()
         .hashtable_power(18) // 256K buckets
-        .build());
+        .build().unwrap());
 
     // Populate cache first
     populate_cache(&cache, KEY_SPACE).await;
@@ -105,7 +105,7 @@ async fn run_benchmark(num_threads: usize) -> (u64, Duration) {
 async fn run_latency_benchmark(num_threads: usize) -> Vec<Duration> {
     let cache = Arc::new(CacheBuilder::new()
         .hashtable_power(18) // 256K buckets
-        .build());
+        .build().unwrap());
 
     // Populate cache first
     populate_cache(&cache, KEY_SPACE).await;

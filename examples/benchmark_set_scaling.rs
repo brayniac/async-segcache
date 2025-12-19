@@ -34,7 +34,7 @@ async fn run_benchmark(num_threads: usize) -> (u64, Duration) {
     // Use larger hashtable to reduce bucket collisions: power=18 = 256K buckets
     let cache = Arc::new(CacheBuilder::new()
         .hashtable_power(18)
-        .build());
+        .build().unwrap());
     let done = Arc::new(AtomicBool::new(false));
     let ops_counter = Arc::new(AtomicU64::new(0));
 
@@ -97,7 +97,7 @@ async fn run_benchmark(num_threads: usize) -> (u64, Duration) {
 async fn run_latency_benchmark(num_threads: usize) -> Vec<Duration> {
     let cache = Arc::new(CacheBuilder::new()
         .hashtable_power(18)
-        .build());
+        .build().unwrap());
     let done = Arc::new(AtomicBool::new(false));
 
     let value = vec![0xAB; VALUE_SIZE];

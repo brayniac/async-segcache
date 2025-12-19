@@ -220,7 +220,8 @@ mod loom_tests {
                 segments: SegmentsBuilder::new()
                     .segment_size(128) // Very small segment
                     .heap_size(128)
-                    .build(),
+                    .build()
+                    .unwrap(),
                 ttl_buckets: TtlBuckets::new(),
                 metrics: CacheMetrics::new(),
             });

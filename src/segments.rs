@@ -1,7 +1,7 @@
 use crate::*;
+use crate::hugepage::{HugepageAllocation, HugepageSize};
 use crate::util::*;
 use clocksource::coarse::AtomicInstant;
-use std::alloc::{Layout, alloc_zeroed};
 use std::ptr::NonNull;
 use crate::sync::*;
 
@@ -13,8 +13,7 @@ const DEFAULT_HEAP_SIZE: usize = 64 * MB;
 #[repr(C, align(64))]
 pub struct Segments {
     pub segments: Vec<Segment<'static>>,
-    heap_ptr: *mut u8,
-    heap_layout: Layout,
+    heap: HugepageAllocation,
     segment_size: usize,
 
     free_queue: crossbeam_deque::Injector<u32>,
@@ -529,18 +528,16 @@ unsafe impl Sync for Segments {}
 
 impl Drop for Segments {
     fn drop(&mut self) {
+        // Clear segments first to ensure any references to heap memory are dropped
         self.segments.clear();
-
-        // Deallocate heap memory
-        unsafe {
-            std::alloc::dealloc(self.heap_ptr, self.heap_layout);
-        }
+        // HugepageAllocation handles deallocation automatically
     }
 }
 
 pub struct SegmentsBuilder {
     segment_size: usize,
     heap_size: usize,
+    hugepage_size: HugepageSize,
 }
 
 impl Default for SegmentsBuilder {
@@ -548,6 +545,7 @@ impl Default for SegmentsBuilder {
         Self {
             segment_size: DEFAULT_SEGMENT_SIZE,
             heap_size: DEFAULT_HEAP_SIZE,
+            hugepage_size: HugepageSize::None,
         }
     }
 }
@@ -567,7 +565,20 @@ impl SegmentsBuilder {
         self
     }
 
-    pub fn build(self) -> Segments {
+    /// Set the hugepage size preference for heap allocation.
+    ///
+    /// - `HugepageSize::None` - Use regular 4KB pages (default)
+    /// - `HugepageSize::TwoMegabyte` - Try 2MB hugepages, fallback to regular
+    /// - `HugepageSize::OneGigabyte` - Try 1GB hugepages, fallback to regular
+    ///
+    /// Note: The actual allocation may fall back to regular pages if the
+    /// requested hugepage size is not available on the system.
+    pub fn hugepage_size(mut self, size: HugepageSize) -> Self {
+        self.hugepage_size = size;
+        self
+    }
+
+    pub fn build(self) -> Result<Segments, std::io::Error> {
         assert!(
             self.heap_size >= self.segment_size,
             "Heap size must be at least as large as segment size"
@@ -579,44 +590,8 @@ impl SegmentsBuilder {
 
         let num_segments = self.heap_size / self.segment_size;
 
-        // Allocate the entire heap as a single page-aligned block
-        // Use 2MB alignment for potential huge page support on systems that support it
-        // Falls back to regular pages if huge pages are not available
-        const HUGE_PAGE_SIZE: usize = 2 * 1024 * 1024; // 2MB
-        const REGULAR_PAGE_SIZE: usize = 4096;
-
-        let alignment = if self.heap_size >= HUGE_PAGE_SIZE && self.heap_size % HUGE_PAGE_SIZE == 0
-        {
-            HUGE_PAGE_SIZE
-        } else {
-            REGULAR_PAGE_SIZE
-        };
-
-        let layout =
-            Layout::from_size_align(self.heap_size, alignment).expect("Failed to create layout");
-
-        // Use alloc_zeroed to get zero-initialized memory
-        // This is important for security and consistency
-        let heap_ptr = unsafe { alloc_zeroed(layout) };
-        if heap_ptr.is_null() {
-            panic!(
-                "Failed to allocate {} bytes for segments heap",
-                self.heap_size
-            );
-        }
-
-        // Pre-fault all pages by touching them
-        // This forces the OS to allocate physical pages now rather than on first access
-        // which avoids page faults during critical write operations
-        unsafe {
-            // Touch only one location per page to minimize memory traffic
-            // One write per page is sufficient to fault the entire page
-            const PAGE_SIZE: usize = 4096;
-
-            for i in (0..self.heap_size).step_by(PAGE_SIZE) {
-                std::ptr::write_volatile(heap_ptr.add(i) as *mut u64, 0);
-            }
-        }
+        // Allocate the heap using hugepage-aware allocation
+        let heap = crate::hugepage::allocate(self.heap_size, self.hugepage_size)?;
 
         // Create segments vector - align(64) on Segment ensures proper alignment
         let mut segments = Vec::with_capacity(num_segments);
@@ -624,7 +599,7 @@ impl SegmentsBuilder {
         // Initialize each segment with its slice of the heap
         for id in 0..num_segments {
             let offset = id * self.segment_size;
-            let segment_ptr = unsafe { heap_ptr.add(offset) };
+            let segment_ptr = unsafe { heap.as_ptr().add(offset) };
 
             // Create lock-free segment
             let segment = unsafe { Segment::new(id as u32, segment_ptr, self.segment_size) };
@@ -637,13 +612,12 @@ impl SegmentsBuilder {
             free_queue.push(id as u32);
         }
 
-        Segments {
+        Ok(Segments {
             segments,
-            heap_ptr,
-            heap_layout: layout,
+            heap,
             segment_size: self.segment_size,
             free_queue,
-        }
+        })
     }
 }
 

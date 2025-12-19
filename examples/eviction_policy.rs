@@ -12,7 +12,7 @@ async fn main() {
         .heap_size(8 * 1024 * 1024) // 8MB
         .segment_size(1024 * 1024)   // 1MB segments
         .eviction_policy(EvictionPolicy::None)
-        .build();
+        .build().unwrap();
     println!("Manual policy: {:?}", cache_manual.eviction_policy());
 
     // Create cache with Random FIFO eviction
@@ -20,7 +20,7 @@ async fn main() {
         .heap_size(8 * 1024 * 1024)
         .segment_size(1024 * 1024)
         .eviction_policy(EvictionPolicy::RandomFifo)
-        .build();
+        .build().unwrap();
     println!("Random FIFO policy: {:?}", cache_fifo.eviction_policy());
 
     // Create cache with CTE (Closest To Expiration) eviction
@@ -28,7 +28,7 @@ async fn main() {
         .heap_size(8 * 1024 * 1024)
         .segment_size(1024 * 1024)
         .eviction_policy(EvictionPolicy::Cte)
-        .build();
+        .build().unwrap();
     println!("CTE policy: {:?}", cache_cte.eviction_policy());
 
     // Add some data to the FIFO cache with different TTLs

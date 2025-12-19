@@ -31,6 +31,7 @@ dependencies = [
  "ahash",
  "clocksource",
  "crossbeam-deque",
+ "libc",
  "loom",
  "rand",
  "tokio",

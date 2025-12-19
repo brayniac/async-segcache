@@ -992,7 +992,7 @@ mod tests {
     fn test_get_basic() {
         // Create hashtable and segments
         let hashtable = Hashtable::new(4); // 16 buckets
-        let segments = SegmentsBuilder::new().build();
+        let segments = SegmentsBuilder::new().build().unwrap();
         let metrics = CacheMetrics::new();
 
         // Reserve a segment and append an item
@@ -1021,7 +1021,7 @@ mod tests {
     #[test]
     fn test_get_not_found() {
         let hashtable = Hashtable::new(4);
-        let segments = SegmentsBuilder::new().build();
+        let segments = SegmentsBuilder::new().build().unwrap();
 
         // Get non-existent key
         let result = hashtable.get(b"nonexistent", &segments);
@@ -1031,7 +1031,7 @@ mod tests {
     #[test]
     fn test_get_deleted_item() {
         let hashtable = Hashtable::new(4);
-        let segments = SegmentsBuilder::new().build();
+        let segments = SegmentsBuilder::new().build().unwrap();
         let metrics = CacheMetrics::new();
 
         // Create and append item
@@ -1060,7 +1060,7 @@ mod tests {
     #[test]
     fn test_link_item_basic() {
         let hashtable = Hashtable::new(4);
-        let segments = SegmentsBuilder::new().build();
+        let segments = SegmentsBuilder::new().build().unwrap();
         let metrics = CacheMetrics::new();
 
         // Reserve segment and append item
@@ -1080,7 +1080,7 @@ mod tests {
     #[test]
     fn test_link_item_bucket_full() {
         let hashtable = Hashtable::new(4);
-        let segments = SegmentsBuilder::new().build();
+        let segments = SegmentsBuilder::new().build().unwrap();
         let metrics = CacheMetrics::new();
 
         // Reserve segment
@@ -1123,7 +1123,7 @@ mod tests {
     #[should_panic(expected = "segment_id")]
     fn test_link_item_segment_id_overflow() {
         let hashtable = Hashtable::new(4);
-        let segments = SegmentsBuilder::new().build();
+        let segments = SegmentsBuilder::new().build().unwrap();
         let metrics = CacheMetrics::new();
 
         // segment_id is 24 bits, max is 0xFFFFFF
@@ -1134,7 +1134,7 @@ mod tests {
     #[should_panic(expected = "offset")]
     fn test_link_item_offset_overflow() {
         let hashtable = Hashtable::new(4);
-        let segments = SegmentsBuilder::new().build();
+        let segments = SegmentsBuilder::new().build().unwrap();
         let metrics = CacheMetrics::new();
 
         // offset is stored as offset/8 in 20 bits, so max is 0xFFFFF * 8 = 8,388,600
@@ -1146,7 +1146,7 @@ mod tests {
     fn test_get_key_mismatch() {
         // Test that tag collision is handled correctly
         let hashtable = Hashtable::new(4);
-        let segments = SegmentsBuilder::new().build();
+        let segments = SegmentsBuilder::new().build().unwrap();
         let metrics = CacheMetrics::new();
 
         // Create item with key1
@@ -1174,7 +1174,7 @@ mod tests {
     fn test_asfc_frequency_tracking() {
         // Test that ASFC frequency tracking works on get operations
         let hashtable = Hashtable::new(4);
-        let segments = SegmentsBuilder::new().build();
+        let segments = SegmentsBuilder::new().build().unwrap();
         let metrics = CacheMetrics::new();
 
         // Create and insert an item

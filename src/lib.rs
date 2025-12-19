@@ -1,4 +1,5 @@
 mod hashtable;
+mod hugepage;
 mod item;
 mod segments;
 mod ttlbuckets;
@@ -6,6 +7,8 @@ mod ttlbuckets;
 pub(crate) mod metrics;
 pub(crate) mod sync;
 pub(crate) mod util;
+
+pub use hugepage::HugepageSize;
 
 #[cfg(test)]
 mod tests;
@@ -136,6 +139,8 @@ pub struct CacheBuilder {
     merge_ratio: usize,
     /// Minimum frequency threshold for items to survive pruning (default: 8)
     merge_target_ratio: usize,
+    /// Hugepage size preference for heap allocation
+    hugepage_size: HugepageSize,
 }
 
 impl CacheBuilder {
@@ -148,6 +153,7 @@ impl CacheBuilder {
             eviction_policy: EvictionPolicy::default(),
             merge_ratio: 4, // Combine 4 segments during merge eviction
             merge_target_ratio: 2, // Target compaction to ~1/2 of original segments
+            hugepage_size: HugepageSize::None,
         }
     }
 
@@ -213,8 +219,21 @@ impl CacheBuilder {
         self
     }
 
+    /// Set the hugepage size preference for heap allocation.
+    ///
+    /// - `HugepageSize::None` - Use regular 4KB pages (default)
+    /// - `HugepageSize::TwoMegabyte` - Try 2MB hugepages, fallback to regular
+    /// - `HugepageSize::OneGigabyte` - Try 1GB hugepages, fallback to regular
+    ///
+    /// Note: The actual allocation may fall back to regular pages if the
+    /// requested hugepage size is not available on the system.
+    pub fn hugepage_size(mut self, size: HugepageSize) -> Self {
+        self.hugepage_size = size;
+        self
+    }
+
     /// Build the Cache with the configured settings
-    pub fn build(self) -> Cache {
+    pub fn build(self) -> Result<Cache, std::io::Error> {
         assert!(
             self.heap_size >= self.segment_size,
             "Heap size must be at least as large as segment size"
@@ -223,7 +242,8 @@ impl CacheBuilder {
         let segments = SegmentsBuilder::new()
             .segment_size(self.segment_size)
             .heap_size(self.heap_size)
-            .build();
+            .hugepage_size(self.hugepage_size)
+            .build()?;
 
         let metrics = CacheMetrics::new();
 
@@ -241,9 +261,9 @@ impl CacheBuilder {
             merge_target_ratio: self.merge_target_ratio,
         });
 
-        Cache {
+        Ok(Cache {
             core,
-        }
+        })
     }
 }
 
@@ -269,10 +289,11 @@ impl Cache {
     ///     .heap_size(256 * 1024 * 1024) // 256MB
     ///     .segment_size(2 * 1024 * 1024) // 2MB segments
     ///     .hashtable_power(18) // 262K buckets
-    ///     .build();
+    ///     .build()
+    ///     .expect("failed to create cache");
     /// ```
     pub fn new() -> Self {
-        CacheBuilder::new().build()
+        CacheBuilder::new().build().expect("failed to allocate cache memory")
     }
 
     /// Get a reference to the cache metrics
@@ -887,7 +908,8 @@ impl Cache {
     ///     .eviction_policy(EvictionPolicy::Merge)
     ///     .merge_ratio(4)  // Combine 4 segments
     ///     .merge_target_ratio(2)  // Into approximately 2 segments
-    ///     .build();
+    ///     .build()
+    ///     .unwrap();
     ///
     /// // Evict using merge strategy
     /// match cache.evict_merge_segment().await {
@@ -1565,7 +1587,8 @@ mod cache_tests {
             .heap_size(128 * 1024 * 1024) // 128MB
             .segment_size(2 * 1024 * 1024) // 2MB segments
             .hashtable_power(18) // 2^18 = 262144 buckets
-            .build();
+            .build()
+            .unwrap();
 
         // Insert some items
         cache.set(b"test1", b"value1", b"", Some(Duration::from_secs(60))).await.unwrap();
@@ -1621,7 +1644,8 @@ mod cache_tests {
         let cache = CacheBuilder::new()
             .heap_size(256 * 1024 * 1024) // 256MB
             .segment_size(1024 * 1024) // 1MB segments
-            .build();
+            .build()
+            .unwrap();
 
         let large_value = vec![b'x'; 100 * 1024]; // 100KB
         let initial_evictions = cache.metrics().segment_evict.value();
@@ -1802,7 +1826,8 @@ mod cache_tests {
         let cache = CacheBuilder::new()
             .heap_size(10 * 1024 * 1024) // Small 10MB cache
             .segment_size(1024 * 1024) // 1MB segments = 10 segments total
-            .build();
+            .build()
+            .unwrap();
 
         let large_value = vec![b'x'; 800 * 1024]; // 800KB
 
@@ -1880,7 +1905,8 @@ mod cache_tests {
         // Test that evicted segments are properly cleaned and reused
         let cache = CacheBuilder::new()
             .heap_size(5 * 1024 * 1024) // 5MB = 5 segments
-            .build();
+            .build()
+            .unwrap();
 
         let value = vec![b'x'; 800 * 1024];
 
@@ -2004,7 +2030,8 @@ mod cache_tests {
         // Test that gauges remain accurate during eviction
         let cache = CacheBuilder::new()
             .heap_size(5 * 1024 * 1024) // 5MB = 5 segments
-            .build();
+            .build()
+            .unwrap();
 
         let large_value = vec![b'x'; 800 * 1024]; // 800KB
 
@@ -2110,7 +2137,8 @@ mod cache_tests {
         let cache = CacheBuilder::new()
             .heap_size(5 * 1024 * 1024) // 5MB = 5 segments
             .segment_size(1 * 1024 * 1024) // 1MB segments
-            .build();
+            .build()
+            .unwrap();
 
         let initial_evictions = cache.metrics().segment_evict.value();
 
@@ -2243,7 +2271,8 @@ mod cache_tests {
     async fn test_ttl_bucket_fills_and_seals() {
         let cache = CacheBuilder::new()
             .segment_size(256 * 1024) // Small segments to force sealing
-            .build();
+            .build()
+            .unwrap();
 
         // Fill a single TTL bucket with large items to force segment sealing
         let large_value = vec![0u8; 50 * 1024]; // 50KB items
@@ -2303,7 +2332,8 @@ mod cache_tests {
         // Create a cache with minimal hashtable (16 buckets)
         let cache = CacheBuilder::new()
             .hashtable_power(4) // 2^4 = 16 buckets
-            .build();
+            .build()
+            .unwrap();
 
         let initial_links = cache.metrics().hashtable_link.value();
 
@@ -2358,7 +2388,8 @@ mod cache_tests {
         // Test hashtable metrics with link success and failure
         let cache = CacheBuilder::new()
             .hashtable_power(5) // 2^5 = 32 buckets = 224 capacity
-            .build();
+            .build()
+            .unwrap();
 
         let initial_links = cache.metrics().hashtable_link.value();
 
@@ -2423,7 +2454,8 @@ mod cache_tests {
 
         let cache = CacheBuilder::new()
             .hashtable_power(4) // 16 buckets = 112 total hashtable slots
-            .build();
+            .build()
+            .unwrap();
 
         let mut successful = 0;
         let mut failed = 0;
@@ -2498,7 +2530,8 @@ mod cache_tests {
             .eviction_policy(EvictionPolicy::Merge)
             .merge_ratio(4)
             .merge_target_ratio(2)
-            .build();
+            .build()
+            .unwrap();
 
         assert_eq!(cache.eviction_policy(), EvictionPolicy::Merge);
         assert_eq!(cache.merge_ratio(), 4);
@@ -2515,7 +2548,8 @@ mod cache_tests {
             .segment_size(4096)  // Small segments to fill quickly
             .heap_size(32 * 4096)  // 32 small segments
             .hashtable_power(10)  // Smaller hashtable
-            .build();
+            .build()
+            .unwrap();
 
         // Initially all metrics should be zero
         assert_eq!(cache.metrics().merge_evict.value(), 0);
@@ -2586,7 +2620,8 @@ mod cache_tests {
             .segment_size(8192)  // 8KB segments
             .heap_size(64 * 1024)  // 64KB total
             .hashtable_power(10)
-            .build();
+            .build()
+            .unwrap();
 
         // Add items and access some frequently
         let value = vec![b'x'; 1024]; // 1KB value
@@ -2621,7 +2656,7 @@ mod cache_tests {
     #[test]
     fn test_default_merge_config() {
         // Test default merge configuration values
-        let cache = CacheBuilder::new().build();
+        let cache = CacheBuilder::new().build().unwrap();
 
         assert_eq!(cache.merge_ratio(), 4, "Default merge_ratio should be 4");
         assert_eq!(cache.merge_target_ratio(), 2, "Default merge_target_ratio should be 2");
